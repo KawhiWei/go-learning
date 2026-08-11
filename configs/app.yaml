@@ -1,0 +1,11 @@
+http:
+  addr: ":8080"
+grpc:
+  addr: ":9090"
+database:
+  url: "postgres://postgres:postgres@localhost:5432/nino?sslmode=disable"
+  max_conns: 10
+  min_conns: 2
+  health_check_seconds: 30
+logger:
+  level: info
