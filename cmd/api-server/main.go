@@ -40,7 +40,7 @@ func main() {
 		hertz.WithMaxRequestBodySize(1<<20),
 		hertz.WithExitWaitTime(10*time.Second),
 	)
-	appserver.RegisterHTTPRoutes(httpServer, appserver.HTTPServices{User: application.Services.User})
+	appserver.RegisterHTTPRoutes(httpServer, appserver.HTTPServices{User: application.Services.UserService})
 
 	log.Info("hertz http server listening", "addr", cfg.HTTP.Addr)
 	httpServer.Spin()

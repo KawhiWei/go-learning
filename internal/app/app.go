@@ -22,7 +22,7 @@ import (
 // 这些用例，repository 仍是 composition root 的实现细节。未来模块完成
 // 业务层后再加入具体 service 字段，不为尚不存在的模块添加空占位。
 type Services struct {
-	User *biz.UserService
+	UserService *biz.UserService
 }
 
 // App 持有一个进程内各服务器共享的资源。
@@ -48,7 +48,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	return &App{
 		pool: p,
 		Services: Services{
-			User: biz.NewUserService(userRepo),
+			UserService: biz.NewUserService(userRepo),
 		},
 	}, nil
 }

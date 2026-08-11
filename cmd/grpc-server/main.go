@@ -50,7 +50,7 @@ func main() {
 	defer application.Close()
 
 	rpcServer := userservice.NewServer(
-		appserver.NewKitexUserServer(application.Services.User),
+		appserver.NewKitexUserServer(application.Services.UserService),
 		kitexserver.WithServiceAddr(addr),
 		kitexserver.WithExitWaitTime(10*time.Second),
 	)

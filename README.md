@@ -98,6 +98,58 @@ Repository 接口定义在业务层，是因为业务层决定自己需要哪些
 
 Handler 不直接访问数据库。新增接口时，应把路由注册和 Handler 放在这一层，把实际业务规则放在 `internal/biz`。
 
+### Hertz Handler 与 Controller
+
+`UserHTTPHandler` 相当于 Java/Spring 或 ASP.NET 项目中的 Controller。Go 和 Hertz 社区通常使用 `Handler` 这个名称，但它承担的仍是协议入口职责：解析 HTTP 请求、调用 Service，并把结果转换成 HTTP 响应。
+
+以创建用户方法为例：
+
+```go
+func (h UserHTTPHandler) Create(ctx context.Context, c *app.RequestContext) {
+    // 从 c 读取 HTTP 请求，通过 h.Service 调用业务层，再把响应写入 c。
+}
+```
+
+各部分含义如下：
+
+| 部分 | 类型 | 含义 |
+|---|---|---|
+| `h` | `UserHTTPHandler` | 方法接收者，表示 `Create` 属于哪个 Handler，并通过 `h.Service` 访问注入的业务服务 |
+| `ctx` | `context.Context` | Hertz 传入的请求生命周期上下文，用于向 Service、Repository 和数据库传递取消、超时、追踪等信号 |
+| `c` | `*app.RequestContext` | Hertz HTTP 请求/响应上下文，用于读取 Path、Query、Header、Body，以及写入状态码和 JSON 响应 |
+
+从函数调用角度看，`h`、`ctx`、`c` 都是传入函数的数据，其中 `h` 使用 Go 的方法接收者语法写在函数名前。这个 Handler 没有 Go 返回值，因为参数列表后直接是函数体：
+
+```go
+func (...) {
+}
+```
+
+如果存在返回值，签名会写成 `func (...) error` 或 `func (...) (*User, error)`。Hertz Handler 不通过 `return response` 返回 HTTP 内容，而是把响应写入 `c`：
+
+```go
+c.JSON(consts.StatusCreated, response)
+```
+
+Handler 中单独出现的 `return` 只表示提前结束当前方法，不携带返回数据：
+
+```go
+if err != nil {
+    c.JSON(consts.StatusBadRequest, errorResponse)
+    return
+}
+```
+
+`ctx` 和 `c` 不能混用。`ctx` 应继续向下传递：
+
+```text
+Handler(ctx) -> Service(ctx) -> Repository(ctx) -> PostgreSQL
+```
+
+`c` 只属于 HTTP 层，不应传入 Service 或 Repository。Handler 应先把 HTTP 参数转换为普通 DTO 或 Go 值，再调用业务层，这样 `biz` 不依赖 Hertz，同一个 Service 才能同时供 HTTP 和 gRPC 使用。
+
+Handler 可以负责参数解析、协议格式校验、Service 调用及 HTTP 错误映射，但不应直接执行 SQL、创建数据库连接、管理 Repository 或实现核心业务规则。
+
 ### 其他工程目录
 
 `internal/config` 负责把 YAML 和环境变量转换为强类型配置；`pkg` 只放真正准备被其他 module 使用的通用代码，不要把所有工具函数都放进去；`configs` 保存默认配置；`migrations` 保存可追踪的数据库结构变更；`scripts` 保存可重复执行的生成和运维命令。
