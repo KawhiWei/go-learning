@@ -12,15 +12,15 @@ import (
 	"github.com/luck/go-learning/internal/biz"
 )
 
-// UserCreator 是 user-events Handler 所需的最小业务接口。Kafka 数据层只
-// 依赖此能力，不知道 Repository、SQL 或连接池的存在。
+// UserCreator 是 user-events Handler 所需的最小业务接口。
+// Kafka 数据层只依赖此能力，不知道 Repository、SQL 或连接池的存在。
 type UserCreator interface {
 	CreateUserWithID(context.Context, uuid.UUID, string, string) (*biz.User, error)
 }
 
-// NewUserCreateHandler 把 user.create.v1 事件转换成 UserService 调用。只有
-// Service 成功（包括相同 user_id 的幂等重投）才返回 nil，Consumer 才提交
-// offset；数据库临时故障会返回 error，触发当前 partition 重试。
+// NewUserCreateHandler 把 user.create.v1 事件转换成 UserService 调用。
+// 只有 Service 成功（包括相同 user_id 的幂等重投）才返回 nil，Consumer 才提交 offset。
+// 数据库临时故障会返回 error，并触发当前 partition 重试。
 func NewUserCreateHandler(service UserCreator, log *slog.Logger) Handler {
 	if log == nil {
 		log = slog.Default()

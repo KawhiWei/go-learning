@@ -49,8 +49,8 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	return newApp(ctx, cfg)
 }
 
-// NewAPI 在公共依赖之外创建 Kafka Producer。API 只发布事件，不加入
-// Consumer Group；消息消费由独立 work 进程承担。
+// NewAPI 在公共依赖之外创建 Kafka Producer。
+// API 只发布事件，不加入 Consumer Group；消息消费由独立 work 进程承担。
 func NewAPI(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error) {
 	application, err := newApp(ctx, cfg)
 	if err != nil {
@@ -70,16 +70,16 @@ func NewAPI(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, err
 		return nil, err
 	}
 	application.kafkaProducer = producer
-	// user-events 是内部业务 Topic，由固定 Handler 按稳定消息 schema 发布；
-	// 从通用事件 API 白名单移除，防止任意 JSON 阻塞 Consumer。
+	// user-events 是内部业务 Topic，由固定 Handler 按稳定消息 schema 发布。
+	// 将它从通用事件 API 白名单移除，可以防止任意 JSON 阻塞 Consumer。
 	application.Services.EventService = biz.NewEventService(producer, topicsExcept(cfg.Kafka.Topics, biz.UserCreateTopic))
 	application.Services.MessagePublisher = biz.NewMessagePublisher(producer, cfg.Kafka.Topics)
 	return application, nil
 }
 
-// NewWorker 创建 Kafka Consumer 与它真正需要的数据库依赖。user-events 使用
-// UserService -> UserRepository 写 PostgreSQL；尚未接入业务的 Topic 仍使用
-// 元数据日志 Handler。HTTP/gRPC server 不会在 Worker 进程中创建。
+// NewWorker 创建 Kafka Consumer 及其真正需要的数据库依赖。
+// user-events 通过 UserService -> UserRepository 写入 PostgreSQL。
+// 尚未接入业务的 Topic 使用元数据日志 Handler；HTTP/gRPC server 不会在 Worker 进程中创建。
 func NewWorker(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error) {
 	if !cfg.Kafka.Enabled {
 		return nil, fmt.Errorf("kafka must be enabled for work process")

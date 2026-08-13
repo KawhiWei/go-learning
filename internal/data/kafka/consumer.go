@@ -20,8 +20,15 @@ type consumerClient interface {
 	CloseAllowingRebalance()
 }
 
-// Consumer 以一次有界 poll 为处理批次。批次内不同 partition 可以并发，同一
-// partition 的 records 始终由一个 worker 按 offset 顺序处理。
+// Consumer 以一次有界 poll 为处理批次。
+// 不同 partition 可以并发处理；同一 partition 的 records 始终由一个 worker 按 offset 顺序处理。
+//
+// 每个批次包含三类 goroutine：
+//   - 调用 processBatch 的主 goroutine：收集处理结果，并决定哪些 offset 可以提交。
+//   - 固定数量的 worker goroutine：从 jobs channel 领取一个 partition 的全部 records，并顺序调用 Handler。
+//   - 一个 dispatcher goroutine：发送 partition job，关闭 jobs，等待全部 worker 退出，最后关闭 results。
+//
+// 这些 goroutine 只在当前批次内存活，不会跨 PollRecords 调用复用或累积。
 type Consumer struct {
 	client          consumerClient
 	router          *Router
@@ -71,14 +78,17 @@ func newConsumer(client consumerClient, cfg config.KafkaConfig, router *Router, 
 
 func (c *Consumer) Run(ctx context.Context) error {
 	for {
+		// PollRecords 在当前 goroutine 中阻塞，不会为每次轮询额外创建应用层 goroutine。
+		// franz-go 在客户端内部维护网络 I/O goroutine；调用方通过 ctx 结束本次阻塞轮询。
 		fetches := c.client.PollRecords(ctx, c.pollMaxRecords)
 		if ctx.Err() != nil {
-			// PollRecords 之后必须解除 BlockRebalanceOnPoll，否则 Close 会等待。
+			// 启用 BlockRebalanceOnPoll 后，每次 PollRecords 返回都必须调用 AllowRebalance。
+			// 即使 ctx 已取消也不能省略，否则 CloseAllowingRebalance 可能一直等待本批次释放分区。
 			c.client.AllowRebalance()
 			return nil
 		}
 		fetches.EachError(func(topic string, partition int32, err error) {
-			// franz-go 会自动刷新 metadata、重建连接并重试可恢复的 broker 错误。
+			// franz-go 会自动刷新 metadata、重建连接，并重试可以恢复的 broker 错误。
 			c.log.Error("poll kafka partition", "topic", topic, "partition", partition, "error", err)
 		})
 		records := fetches.Records()
@@ -87,7 +97,8 @@ func (c *Consumer) Run(ctx context.Context) error {
 			continue
 		}
 
-		// signal 到达后给当前批次一个独立的收尾窗口，而不是立刻取消 Handler。
+		// batchCtx 不会在进程信号到达时立刻取消，而是给当前批次一个独立的收尾窗口。
+		// 这样正在执行的 Handler 有机会完成，成功结果也有机会在进程退出前提交 offset。
 		batchCtx, finishBatch := batchContext(ctx, c.shutdownTimeout)
 		committable, err := c.processBatch(batchCtx, records)
 		if len(committable) > 0 {
@@ -95,7 +106,9 @@ func (c *Consumer) Run(ctx context.Context) error {
 				err = commitErr
 			}
 		}
+		// processBatch 和 commitWithRetry 返回后，批次内 worker 已全部退出，此时取消监督 goroutine 是安全的。
 		finishBatch()
+		// offset 处理结束后再允许 rebalance，避免分区在 Handler 运行期间被转交给其他 Consumer。
 		c.client.AllowRebalance()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -124,9 +137,9 @@ type partitionResult struct {
 }
 
 func (c *Consumer) processBatch(ctx context.Context, records []*kgo.Record) ([]*kgo.Record, error) {
-	// 并发池按 Topic+Partition 分 job，而不是按单条消息分 job。Kafka 只保证
-	// partition 内顺序；若把同一 partition 的消息交给多个 goroutine，后到
-	// 的 offset 可能先完成并被提交，进程崩溃后中间失败消息将无法重投。
+	// 并发池以 Topic+Partition 为 job 粒度，而不是以单条消息为 job 粒度。
+	// Kafka 只保证 partition 内顺序；如果同一 partition 由多个 goroutine 同时处理，较大的 offset 可能先成功并被提交。
+	// 一旦较大的 offset 被提交，进程崩溃后位于它之前的失败消息将不会再次投递，因此这里必须先按 partition 分组。
 	grouped := make(map[partitionKey][]*kgo.Record)
 	for _, record := range records {
 		key := partitionKey{topic: record.Topic, partition: record.Partition}
@@ -139,20 +152,23 @@ func (c *Consumer) processBatch(ctx context.Context, records []*kgo.Record) ([]*
 	if workers > len(grouped) {
 		workers = len(grouped)
 	}
-	// 实际 goroutine 数取 min(worker_concurrency, 当前批次 partition 数)。
-	// 因此把配置调到远高于 partition 数不会提高吞吐，只会提高潜在资源上限。
-	// Handler 会访问数据库时，还应满足 worker_concurrency <= DB max_conns，
-	// 并给 HTTP/gRPC 查询预留连接，否则 Worker 会把连接池占满并放大延迟。
+	// 实际 worker goroutine 数取 min(worker_concurrency, 当前批次包含的 partition 数)。
+	// worker_concurrency 高于 partition 数不会增加并行度，因为同一 partition 不能拆给多个 worker。
+	// Handler 访问数据库时，worker_concurrency 通常不应高于 DB max_conns，并且还要为其他数据库操作预留连接。
+	// jobs 不设置缓冲，使 dispatcher 只在某个 worker 准备好接收时才继续发送，避免预先堆积重复的任务引用。
 	jobs := make(chan partitionJob)
+	// 每个 partition 最多产生一个结果。缓冲区容量等于 partition 数，可以保证 worker 上报结果时不会等待主 goroutine 开始读取。
 	results := make(chan partitionResult, len(grouped))
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
-			// Worker goroutine 只在当前 poll 批次存活。批次结束后 WaitGroup
-			// 确认全部退出，避免每次 PollRecords 都累积后台 goroutine。
+			// 每个 worker goroutine 只在当前 poll 批次存活，并在 jobs 关闭且队列耗尽后退出。
+			// Done 放在 defer 中，确保 worker 无论从哪个正常路径返回，dispatcher 都能观察到它已经结束。
 			defer wg.Done()
 			for job := range jobs {
+				// 一个 job 只包含同一 Topic+Partition 的消息，因此这个循环天然保持 offset 顺序。
+				// 当前消息持续失败时，handleWithRetry 会阻塞这个 partition，但不会阻止其他 worker 处理其他 partition。
 				var err error
 				for _, record := range job.records {
 					if err = c.handleWithRetry(ctx, record); err != nil {
@@ -161,26 +177,31 @@ func (c *Consumer) processBatch(ctx context.Context, records []*kgo.Record) ([]*
 				}
 				result := partitionResult{err: err}
 				if err == nil {
+					// 只有整个 partition job 全部成功时才返回最后一条 record，防止越过中间失败的 offset。
 					result.last = job.records[len(job.records)-1]
 				}
+				// results 有足够容量容纳所有 partition 的结果，因此 worker 不会在此处与结果收集形成循环等待。
 				results <- result
 			}
 		}()
 	}
 	go func() {
-		// 单独的 dispatcher 负责关闭 jobs、等待 worker，再关闭 results。
-		// results 使用 partition 数作为 buffer，worker 即使先完成也不会因
-		// 主 goroutine 尚未开始收集而互相阻塞，降低尾延迟。
+		// dispatcher goroutine 是 jobs 的唯一发送方和关闭方，因此不会发生重复关闭 channel 的竞争。
 		for _, partitionRecords := range grouped {
 			jobs <- partitionJob{records: partitionRecords}
 		}
+		// 关闭 jobs 告诉 worker 不会再有新任务；已经发送的任务仍会处理完。
 		close(jobs)
+		// 必须等待所有 worker 停止写 results，才能关闭 results，否则 worker 可能向已关闭的 channel 发送并触发 panic。
 		wg.Wait()
+		// 主 goroutine 使用 range 读取 results；关闭 channel 是通知它“所有 partition 都已返回结果”的唯一结束信号。
 		close(results)
 	}()
 
 	committable := make([]*kgo.Record, 0, len(grouped))
 	var firstErr error
+	// 当前 goroutine 持续读取 results，直到 dispatcher 在所有 worker 退出后关闭 channel。
+	// 成功 partition 的最后一条 record 可以提交；失败 partition 不加入 committable，因此不会推进它的 offset。
 	for result := range results {
 		if result.err != nil && firstErr == nil {
 			firstErr = result.err
@@ -195,6 +216,7 @@ func (c *Consumer) processBatch(ctx context.Context, records []*kgo.Record) ([]*
 func (c *Consumer) handleWithRetry(ctx context.Context, record *kgo.Record) error {
 	message := toMessage(record)
 	for {
+		// 重试发生在负责该 partition 的 worker goroutine 内，所以重试期间仍然保持分区顺序。
 		if err := c.router.Handle(ctx, message); err != nil {
 			c.log.Error("handle kafka message", "topic", record.Topic, "partition", record.Partition,
 				"offset", record.Offset, "key_size", len(record.Key), "value_size", len(record.Value), "error", err)
@@ -209,6 +231,8 @@ func (c *Consumer) handleWithRetry(ctx context.Context, record *kgo.Record) erro
 
 func (c *Consumer) commitWithRetry(ctx context.Context, records []*kgo.Record) error {
 	for {
+		// CommitRecords 失败时只重试提交，不重新执行已经成功的 Handler。
+		// records 中每个 partition 只有最后一条成功 record，franz-go 会提交它之后的下一个 offset。
 		if err := c.client.CommitRecords(ctx, records...); err != nil {
 			c.log.Error("commit kafka offsets", "partitions", len(records), "error", err)
 			if err := waitForRetry(ctx, c.retryInterval); err != nil {
@@ -224,22 +248,30 @@ func (c *Consumer) Close() {
 	if c == nil || c.client == nil {
 		return
 	}
+	// sync.Once 允许多个退出路径安全调用 Close，并确保底层客户端只关闭一次。
 	c.closeOnce.Do(c.client.CloseAllowingRebalance)
 }
 
 func batchContext(signalCtx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	// 使用 Background 派生批次上下文，避免 signalCtx 取消时立即中断在途 Handler。
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
+		// 这个监督 goroutine 只等待两个事件：进程退出信号，或者批次主动完成。
+		// 批次主动完成时，外层调用 finishBatch（即 cancel），监督 goroutine 会立即退出，不会泄漏到下一次 poll。
 		select {
 		case <-signalCtx.Done():
+			// 收到退出信号后开始计时；超时前允许 Handler 和 offset 提交继续执行。
 			timer := time.NewTimer(timeout)
 			defer timer.Stop()
 			select {
 			case <-timer.C:
+				// 超过关闭窗口后取消批次，唤醒 Handler 重试等待和 offset 提交重试。
 				cancel()
 			case <-ctx.Done():
+				// 批次在超时前完成，直接退出监督 goroutine。
 			}
 		case <-ctx.Done():
+			// 正常处理完成时由 finishBatch 触发，无需启动关闭计时器。
 		}
 	}()
 	return ctx, cancel

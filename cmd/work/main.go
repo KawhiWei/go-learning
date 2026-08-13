@@ -18,8 +18,8 @@ func main() {
 	}
 }
 
-// run 是 Worker 进程唯一的生命周期入口：加载配置、装配 Consumer、监听
-// SIGINT/SIGTERM，并在退出前等待 Consumer 停止在途任务和离开消费组。
+// run 是 Worker 进程唯一的生命周期入口。
+// 它负责加载配置、装配 Consumer、监听 SIGINT/SIGTERM，并在退出前等待 Consumer 停止在途任务和离开消费组。
 func run() error {
 	log := logger.New(os.Getenv("NINO_LOG_LEVEL"))
 	configPath := os.Getenv("NINO_CONFIG_PATH")

@@ -71,32 +71,15 @@ Go 官方没有规定 Web 服务必须采用某一种目录结构。本项目使
 
 `main.go` 调用 `internal/app.New` 创建完整应用是正常的启动流程，但不应该自己执行 SQL、创建 Repository 或处理业务请求。运行期间的请求仍然由路由进入 Handler。
 
-`cmd/api-server` 的启动形态借鉴 CloudWeGo Hertz 官方
-`hertz-examples/bizdemo/hertz_gorm`：构造 Hertz 实例、注册路由，再调用
-`h.Spin()`。Spin 默认处理 `SIGINT`、`SIGHUP` 和 `SIGTERM`，并在退出时等待
-进行中的请求完成；本项目仍保留 `internal/app` composition root 和
-Handler -> Service -> Repository 的依赖注入分层。具体来说，`NewHTTPServer`
-只创建 Hertz 与全局 404/405 fallback，业务 service 通过显式的
-`RegisterHTTPRoutes` 注入，不把官方示例中的全局 DB 或 Handler 直连方式带入本项目。
+`cmd/api-server` 的启动形态借鉴 CloudWeGo Hertz 官方 `hertz-examples/bizdemo/hertz_gorm`：构造 Hertz 实例、注册路由，再调用 `h.Spin()`。Spin 默认处理 `SIGINT`、`SIGHUP` 和 `SIGTERM`，并在退出时等待进行中的请求完成；本项目仍保留 `internal/app` composition root 和 Handler -> Service -> Repository 的依赖注入分层。具体来说，`NewHTTPServer` 只创建 Hertz 与全局 404/405 fallback，业务 service 通过显式的 `RegisterHTTPRoutes` 注入，不把官方示例中的全局 DB 或 Handler 直连方式带入本项目。
 
-`cmd/grpc-server` 同样把 RPC 生命周期交给 Kitex：入口直接调用阻塞式
-`rpcServer.Run()`，不再另外创建 signal channel、goroutine 或手动调用
-`rpcServer.Stop()`。Kitex 完成优雅关闭并返回后，`defer application.Close()`
-再释放 PostgreSQL 连接池。
+`cmd/grpc-server` 同样把 RPC 生命周期交给 Kitex：入口直接调用阻塞式 `rpcServer.Run()`，不再另外创建 signal channel、goroutine 或手动调用 `rpcServer.Stop()`。Kitex 完成优雅关闭并返回后，`defer application.Close()` 再释放 PostgreSQL 连接池。
 
-`cmd/work/main.go` 是独立的 Kafka Consumer 进程，由自身生命周期管理，不由 HTTP API 进程启动。它调用
-`internal/app.NewWorker` 创建数据库连接池、User Repository/Service、Consumer
-Group 和 Topic Router。它把 `user-events` 交给真实的用户创建 Handler，把尚未
-接入业务的 `audit-events` 交给元数据占位 Handler；收到 `SIGTERM` 后停止拉取，
-等待在途任务和 offset 处理完成再退出。API 只发布消息，不加入 Consumer Group。
+`cmd/work/main.go` 是独立的 Kafka Consumer 进程，由自身生命周期管理，不由 HTTP API 进程启动。它调用 `internal/app.NewWorker` 创建数据库连接池、User Repository/Service、Consumer Group 和 Topic Router。它把 `user-events` 交给真实的用户创建 Handler，把尚未接入业务的 `audit-events` 交给元数据占位 Handler；收到 `SIGTERM` 后停止拉取，等待在途任务和 offset 处理完成再退出。API 只发布消息，不加入 Consumer Group。
 
 ### `internal/app`：依赖组装层
 
-这是应用的 Composition Root。API 进程按 PostgreSQL Pool -> Repository -> Service，
-再创建 Kafka Producer -> EventService/MessagePublisher 的顺序装配；Worker
-装配自己的 PostgreSQL Pool -> UserRepository -> UserService -> user-events Handler，
-以及 Kafka Consumer/Router，但不创建 HTTP 或 gRPC server。每个进程只关闭自己创建的
-连接池和 Kafka 客户端。
+这是应用的 Composition Root。API 进程按 PostgreSQL Pool -> Repository -> Service，再创建 Kafka Producer -> EventService/MessagePublisher 的顺序装配；Worker 装配自己的 PostgreSQL Pool -> UserRepository -> UserService -> user-events Handler，以及 Kafka Consumer/Router，但不创建 HTTP 或 gRPC server。每个进程只关闭自己创建的连接池和 Kafka 客户端。
 
 依赖组装只在程序启动时执行一次，不属于某个 HTTP/gRPC 请求的调用链。以后增加 `OrderService` 时，应在这里增加对应 Repository 和 Service 的组装，而不是继续向 `main.go` 填充初始化细节。
 
@@ -106,16 +89,9 @@ Group 和 Topic Router。它把 `user-events` 交给真实的用户创建 Handle
 
 Repository 接口定义在业务层，是因为业务层决定自己需要哪些持久化能力；数据层只负责实现它。业务层不应依赖 Hertz、Kitex、PostgreSQL 驱动或 HTTP 状态码，因此相同 Service 可以同时被 HTTP 和 gRPC Handler 使用。
 
-异步消息采用统一的 `MessagePublisher`。每个业务只定义自己的稳定消息 DTO
-和构造函数，例如 `UserCreateMessage`/`NewUserCreateMessage`：构造函数负责该业务的
-输入校验、默认值和 ID 生成。消息 DTO 不需要实现 `Topic()`、`Key()` 或任何公共
-`Command` 接口；不同业务的 DTO 可以共用同一个 Publisher。
+异步消息采用统一的 `MessagePublisher`。每个业务只定义自己的稳定消息 DTO 和构造函数，例如 `UserCreateMessage`/`NewUserCreateMessage`：构造函数负责该业务的输入校验、默认值和 ID 生成。消息 DTO 不需要实现 `Topic()`、`Key()` 或任何公共 `Command` 接口；不同业务的 DTO 可以共用同一个 Publisher。
 
-调用方把消息体、Topic 和 Kafka key 显式传给统一 Publisher。Publisher 负责 JSON
-marshal、Topic 白名单、非空 key 校验以及底层 Kafka publish/ack。`body` 可以是任意
-可 JSON 编码的 struct、map 或 slice，但生产环境建议使用稳定的强类型 struct，
-因为它更容易做 schema review、版本兼容和消费者校验。Topic/key 应由业务代码或
-配置决定，不应直接透传未经校验的 HTTP 参数。
+调用方把消息体、Topic 和 Kafka key 显式传给统一 Publisher。Publisher 负责 JSON marshal、Topic 白名单、非空 key 校验以及底层 Kafka publish/ack。`body` 可以是任意可 JSON 编码的 struct、map 或 slice，但生产环境建议使用稳定的强类型 struct，因为它更容易做 schema review、版本兼容和消费者校验。Topic/key 应由业务代码或配置决定，不应直接透传未经校验的 HTTP 参数。
 
 未来的订单消息可以复用同一个 Publisher：
 
@@ -131,9 +107,7 @@ message := OrderCreateMessage{MessageID: id, OrderID: orderID, Type: "order.crea
 err := publisher.Publish(ctx, "order-events", []byte(message.OrderID), message)
 ```
 
-因此，新增业务通常只需要新增自己的消息 DTO/构造函数和消费者 Handler，不需要再
-定义一个 `OrderCreateCommandService` 或让 DTO 实现公共接口。`MessagePublisher`
-仍会拒绝未登记的 Topic，确保消息只能进入应用明确允许的 Topic。
+因此，新增业务通常只需要新增自己的消息 DTO/构造函数和消费者 Handler，不需要再定义一个 `OrderCreateCommandService` 或让 DTO 实现公共接口。`MessagePublisher` 仍会拒绝未登记的 Topic，确保消息只能进入应用明确允许的 Topic。
 
 ### `internal/data`：数据与基础设施层
 
@@ -163,11 +137,7 @@ nino-data-work
     -> Handler 成功后提交 offset
 ```
 
-`202` 只表示 Kafka 已确认消息，数据库可能还没有完成写入。响应中的 `resource_id`
-可用于随后调用 `GET /v1/users/:id`；短时间返回 `404` 属于最终一致性窗口，客户端
-应采用有上限的退避重试。相同事件重投会携带相同 `user_id`：数据库中 ID 与内容
-完全一致时视为幂等成功；同 ID 不同内容或 email 已被其他 ID 使用仍是冲突，不会
-被静默忽略。gRPC 的 CreateUser 暂时仍保持原同步写库语义。
+`202` 只表示 Kafka 已确认消息，数据库可能还没有完成写入。响应中的 `resource_id` 可用于随后调用 `GET /v1/users/:id`；短时间返回 `404` 属于最终一致性窗口，客户端应采用有上限的退避重试。相同事件重投会携带相同 `user_id`：数据库中 ID 与内容完全一致时视为幂等成功；同 ID 不同内容或 email 已被其他 ID 使用仍是冲突，不会被静默忽略。gRPC 的 CreateUser 暂时仍保持原同步写库语义。
 
 API 的事件发布链路只有发布职责，不消费 Kafka：
 
@@ -183,9 +153,7 @@ POST /v1/events/:topic
 
 `EventService` 从配置的 `kafka.topics` 生成 Topic 白名单，并排除系统消息 Topic。请求的 `:topic` 不在白名单时直接返回参数错误，不会向任意内部 Topic 发布。Producer 等待 broker 确认后，Handler 才返回 `202 Accepted`；这个状态只表示消息已交给 Kafka，不表示 Worker 已经取到消息、Handler 已完成或数据库事务已经提交。Producer 超时或 broker 不可用时返回发布失败，API 不伪造成功响应。
 
-`user-events` 是内部系统消息 Topic，已从通用 `/v1/events/:topic` 白名单排除，避免任意
-JSON 绕过用户校验并形成毒消息。创建用户必须调用 `/v1/users`；通用事件接口目前可用于
-`audit-events` 等非系统命令 Topic。
+`user-events` 是内部系统消息 Topic，已从通用 `/v1/events/:topic` 白名单排除，避免任意 JSON 绕过用户校验并形成毒消息。创建用户必须调用 `/v1/users`；通用事件接口目前可用于 `audit-events` 等非系统命令 Topic。
 
 Worker 由 `cmd/work/main.go` 独立运行：一个 Consumer Group（`group_id`）同时订阅 `topics` 中的全部 Topic，Kafka 负责把各 Topic 的 partition 分配给该 Group 的 Worker 实例。Router 按 Topic 找到业务 Handler，消息 DTO 不把 franz-go 类型泄露给业务层。
 
@@ -201,18 +169,11 @@ PollRecords（最多 poll_max_records 条）
 
 并发上限跨所有 Topic/partition 共享；不同 partition 可以并行，同一 partition 始终保序。Handler 返回错误时按 `retry_interval_seconds` 重试且不推进该 partition 的提交点；提交失败也按同一间隔重试，但已成功的 Handler 不因提交重试再次执行。应用退出或 rebalance 时停止接收新任务，等待在途任务结束，提交已经连续完成的 offset，再安全释放 partition；无法在 `shutdown_timeout_seconds` 内完成的任务会随进程退出而由 Kafka 重新投递。franz-go 负责 broker 连接维护和断线重连，Worker 对轮询、Handler、提交错误做日志记录和重试。
 
-`user-events` 已注册 `UserCreateHandler` 并写 PostgreSQL；`audit-events` 当前仍使用
-`NewMetadataLoggingHandler` 占位，只记录 Topic、partition、offset 和 key/value 字节数，
-不输出消息正文。Handler 成功但 offset 尚未提交时仍可能重投，所以所有真实 Handler
-都必须幂等。当前失败消息会无限重试：毒消息会阻塞自己的 partition，并让本次 poll
-批次等待收尾；其他 partition 的 Handler 可以并发完成，但 offset 也要等批次进入提交
-阶段。生产环境还应增加重试上限、DLQ、告警和 lag 监控；当前实现尚未提供 DLQ。
+`user-events` 已注册 `UserCreateHandler` 并写 PostgreSQL；`audit-events` 当前仍使用 `NewMetadataLoggingHandler` 占位，只记录 Topic、partition、offset 和 key/value 字节数，不输出消息正文。Handler 成功但 offset 尚未提交时仍可能重投，所以所有真实 Handler 都必须幂等。当前失败消息会无限重试：毒消息会阻塞自己的 partition，并让本次 poll 批次等待收尾；其他 partition 的 Handler 可以并发完成，但 offset 也要等批次进入提交阶段。生产环境还应增加重试上限、DLQ、告警和 lag 监控；当前实现尚未提供 DLQ。
 
 ### Goroutine 与并发池调优
 
-Consumer 的并发单位是 `Topic + Partition`，不是单条消息。同一 partition 的消息由
-同一个 goroutine 按 offset 顺序处理，避免后面的 offset 先提交导致中间消息丢失。
-每次 poll 实际创建的 worker 数为：
+Consumer 的并发单位是 `Topic + Partition`，不是单条消息。同一 partition 的消息由同一个 goroutine 按 offset 顺序处理，避免后面的 offset 先提交导致中间消息丢失。每次 poll 实际创建的 worker 数为：
 
 ```text
 min(worker_concurrency, 当前批次包含的 partition 数)
@@ -369,14 +330,15 @@ kafka:
 
 ## Docker Compose
 
-Compose 会启动 PostgreSQL 和单节点 Kafka，运行一次数据库迁移，创建 `user-events`、`audit-events` 两个 Topic，再启动 API、独立 Worker 和 gRPC 服务。后台启动：
+Compose 会启动 PostgreSQL、单节点 Kafka 和 Kafbat Kafka UI，运行一次数据库迁移，创建 `user-events`、`audit-events` 两个 Topic，再启动 API、独立 Worker 和 gRPC 服务。后台启动：
 
-PostgreSQL 容器的 `5432` 映射到宿主机 `51432`；宿主机数据库客户端使用
-`localhost:51432`，Compose 内部服务仍使用 `db:5432`。
+PostgreSQL 容器的 `5432` 映射到宿主机 `51432`；宿主机数据库客户端使用 `localhost:51432`，Compose 内部服务仍使用 `db:5432`。
 
 ```sh
 docker compose up --build -d
 ```
+
+Kafka 可视化面板地址为 `http://localhost:8081`。面板中的 `local` 集群通过 Compose 内部地址 `kafka:9092` 连接 Kafka，可以查看 Broker、Topic、消息和 Consumer Group。
 
 HTTP 健康检查地址为 `http://localhost:8080/healthz`。查看当前 Topic：
 
@@ -400,9 +362,7 @@ curl -i -X POST http://localhost:8080/v1/events/audit-events \
   -d '{"key":"demo-user","payload":{"event":"login","actor":"demo-user"}}'
 ```
 
-也可以使用 Kafka CLI 向仍采用占位 Handler 的 `audit-events` 写入测试消息。
-不要手工向 `user-events` 写任意 JSON；它要求严格的 `user.create.v1` schema、UUID
-和与 `user_id` 一致的 Kafka key，应始终通过 `/v1/users` 生成：
+也可以使用 Kafka CLI 向仍采用占位 Handler 的 `audit-events` 写入测试消息。不要手工向 `user-events` 写任意 JSON；它要求严格的 `user.create.v1` schema、UUID 和与 `user_id` 一致的 Kafka key，应始终通过 `/v1/users` 生成：
 
 ```sh
 printf '%s\n' '{"event":"login","actor":"demo-user"}' | \
@@ -417,9 +377,7 @@ printf '%s\n' '{"event":"login","actor":"demo-user"}' | \
 docker compose logs -f work
 ```
 
-`audit-events` 日志中的 `topic`、`partition`、`offset`、`key_size` 和 `value_size`
-是占位 Handler 记录的元数据，不包含正文；`user-events` 成功日志会包含事件和用户 ID。
-查看 Worker Consumer Group `nino-data-work` 的 partition offset、lag 等信息：
+`audit-events` 日志中的 `topic`、`partition`、`offset`、`key_size` 和 `value_size` 是占位 Handler 记录的元数据，不包含正文；`user-events` 成功日志会包含事件和用户 ID。查看 Worker Consumer Group `nino-data-work` 的 partition offset、lag 等信息：
 
 ```sh
 docker compose exec kafka \

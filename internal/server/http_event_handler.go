@@ -23,14 +23,14 @@ type publishEventResponse struct {
 	Topic  string `json:"topic"`
 }
 
-// EventHTTPHandler 相当于 Event Controller：解析 HTTP DTO 后调用业务 Service，
-// 不直接持有或操作 Kafka Producer。
+// EventHTTPHandler 相当于 Event Controller：解析 HTTP DTO 后调用业务 Service。
+// 它不直接持有或操作 Kafka Producer。
 type EventHTTPHandler struct {
 	Service EventService
 }
 
-// Publish 在 broker 确认消息后返回 202。202 表示消息已经可靠交给 Kafka，
-// 不表示下游 Worker 已经完成业务处理。
+// Publish 在 broker 确认消息后返回 202。
+// 202 表示消息已经可靠交给 Kafka，不表示下游 Worker 已经完成业务处理。
 func (h EventHTTPHandler) Publish(ctx context.Context, c *app.RequestContext) {
 	body, err := c.Body()
 	if err != nil || len(body) > maxJSONRequestBodySize {

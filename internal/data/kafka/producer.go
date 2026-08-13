@@ -19,8 +19,8 @@ type producerClient interface {
 	Close()
 }
 
-// Producer 等待 Kafka 对每条消息的确认。franz-go 默认启用幂等 Producer，
-// 并自动处理 broker 连接恢复、metadata 更新和可重试请求。
+// Producer 等待 Kafka 对每条消息的确认。
+// franz-go 默认启用幂等 Producer，并自动处理 broker 连接恢复、metadata 更新和可重试请求。
 type Producer struct {
 	client  producerClient
 	timeout time.Duration
