@@ -41,11 +41,17 @@ func NewUserService(repo UserRepository) *UserService {
 }
 
 func (s *UserService) CreateUser(ctx context.Context, name, email string) (*User, error) {
+	return s.CreateUserWithID(ctx, uuid.Nil, name, email)
+}
+
+// CreateUserWithID 供消息 Consumer 使用调用方预先生成的 user ID。稳定 ID
+// 是 at-least-once 消费实现幂等的关键：同一 Kafka 事件重投时不会生成新用户。
+func (s *UserService) CreateUserWithID(ctx context.Context, id uuid.UUID, name, email string) (*User, error) {
 	name, email, err := validateUser(name, email)
 	if err != nil {
 		return nil, err
 	}
-	return s.repo.Create(ctx, &User{Name: name, Email: email})
+	return s.repo.Create(ctx, &User{ID: id, Name: name, Email: email})
 }
 
 func (s *UserService) GetUser(ctx context.Context, id uuid.UUID) (*User, error) {

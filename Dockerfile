@@ -6,6 +6,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/api-server ./cmd/api-server
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/grpc-server ./cmd/grpc-server
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/work ./cmd/work
 
 FROM alpine:3.21
 
@@ -15,6 +16,7 @@ RUN apk add --no-cache ca-certificates wget netcat-openbsd \
 WORKDIR /app
 COPY --from=build /out/api-server /app/api-server
 COPY --from=build /out/grpc-server /app/grpc-server
+COPY --from=build /out/work /app/work
 COPY configs /app/configs
 COPY migrations /app/migrations
 USER app

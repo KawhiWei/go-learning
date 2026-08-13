@@ -22,6 +22,30 @@ type fakeHTTPService struct {
 	getErr    error
 }
 
+type fakeMessagePublisher struct {
+	topic string
+	key   []byte
+	body  any
+	err   error
+}
+
+func (f *fakeMessagePublisher) Publish(_ context.Context, topic string, key []byte, body any) error {
+	f.topic = topic
+	f.key = append([]byte(nil), key...)
+	f.body = body
+	return f.err
+}
+
+type fakeEventService struct {
+	event biz.Event
+	err   error
+}
+
+func (f *fakeEventService) Publish(_ context.Context, event biz.Event) error {
+	f.event = event
+	return f.err
+}
+
 func (f *fakeHTTPService) CreateUser(_ context.Context, name, email string) (*biz.User, error) {
 	if f.createErr != nil {
 		return nil, f.createErr
@@ -38,12 +62,16 @@ func (f *fakeHTTPService) GetUser(_ context.Context, _ uuid.UUID) (*biz.User, er
 }
 
 func performRequest(service UserService, method, path, body string) *ut.ResponseRecorder {
+	return performRequestWithServices(HTTPServices{User: service, Publisher: &fakeMessagePublisher{}}, method, path, body)
+}
+
+func performRequestWithServices(services HTTPServices, method, path, body string) *ut.ResponseRecorder {
 	var requestBody *ut.Body
 	if body != "" {
 		requestBody = &ut.Body{Body: strings.NewReader(body), Len: len(body)}
 	}
 	h := NewHTTPServer()
-	RegisterHTTPRoutes(h, HTTPServices{User: service})
+	RegisterHTTPRoutes(h, services)
 	return ut.PerformRequest(
 		h.Engine,
 		method,
@@ -53,22 +81,72 @@ func performRequest(service UserService, method, path, body string) *ut.Response
 	)
 }
 
+func TestHTTPPublishesEvent(t *testing.T) {
+	service := &fakeEventService{}
+	response := performRequestWithServices(
+		HTTPServices{User: &fakeHTTPService{}, Event: service},
+		http.MethodPost,
+		"/v1/events/user-events",
+		`{"key":"user-1","payload":{"action":"created"}}`,
+	)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusAccepted, response.Body.String())
+	}
+	if service.event.Topic != "user-events" || string(service.event.Key) != "user-1" || string(service.event.Payload) != `{"action":"created"}` {
+		t.Fatalf("event = %#v", service.event)
+	}
+}
+
+func TestHTTPMapsEventPublishErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "topic", err: biz.ErrEventTopicNotAllowed, want: http.StatusBadRequest},
+		{name: "producer", err: errors.New("broker unavailable"), want: http.StatusServiceUnavailable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			response := performRequestWithServices(
+				HTTPServices{User: &fakeHTTPService{}, Event: &fakeEventService{err: tc.err}},
+				http.MethodPost, "/v1/events/user-events", `{"payload":{"id":1}}`,
+			)
+			if response.Code != tc.want {
+				t.Fatalf("status = %d, want %d", response.Code, tc.want)
+			}
+		})
+	}
+}
+
 func TestHTTPCreateUser(t *testing.T) {
-	response := performRequest(
-		&fakeHTTPService{},
+	queryService := &fakeHTTPService{}
+	publisher := &fakeMessagePublisher{}
+	response := performRequestWithServices(
+		HTTPServices{User: queryService, Publisher: publisher},
 		http.MethodPost,
 		"/v1/users",
 		`{"name":"Alice","email":"alice@example.com"}`,
 	)
-	if response.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want %d", response.Code, http.StatusCreated)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusAccepted)
 	}
-	var body userResponse
+	var body biz.PublishAccepted
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if body.Name != "Alice" || body.Email != "alice@example.com" {
+	if body.Status != "accepted" || body.ResourceID == "" || body.MessageID == "" {
 		t.Fatalf("body = %#v", body)
+	}
+	message, ok := publisher.body.(biz.UserCreateMessage)
+	if !ok || message.Name != "Alice" || message.Email != "alice@example.com" {
+		t.Fatalf("message = %#v", publisher.body)
+	}
+	if publisher.topic != biz.UserCreateTopic || string(publisher.key) != message.UserID {
+		t.Fatalf("publish metadata topic=%q key=%q message=%#v", publisher.topic, publisher.key, message)
+	}
+	if queryService.created != nil {
+		t.Fatal("HTTP create must not call synchronous UserService.CreateUser")
 	}
 }
 
@@ -86,36 +164,16 @@ func TestHTTPRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
-func TestHTTPMapsServiceErrors(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-		want int
-	}{
-		{name: "invalid", err: biz.ErrInvalidArgument, want: http.StatusBadRequest},
-		{name: "exists", err: biz.ErrAlreadyExists, want: http.StatusConflict},
-		{name: "missing", err: biz.ErrNotFound, want: http.StatusNotFound},
-		{name: "internal", err: errors.New("boom"), want: http.StatusInternalServerError},
+func TestHTTPMapsAsyncUserCommandErrors(t *testing.T) {
+	invalid := performRequest(&fakeHTTPService{}, http.MethodPost, "/v1/users", `{"name":"","email":"alice@example.com"}`)
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid status = %d", invalid.Code)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			response := performRequest(
-				&fakeHTTPService{createErr: tc.err},
-				http.MethodPost,
-				"/v1/users",
-				`{"name":"Alice","email":"alice@example.com"}`,
-			)
-			if response.Code != tc.want {
-				t.Fatalf("status = %d, want %d", response.Code, tc.want)
-			}
-			var body errorResponse
-			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
-				t.Fatalf("decode error response: %v", err)
-			}
-			if body.Error.Code == "" {
-				t.Fatal("error code is empty")
-			}
-		})
+	publisherFailure := performRequestWithServices(HTTPServices{
+		User: &fakeHTTPService{}, Publisher: &fakeMessagePublisher{err: errors.New("broker unavailable")},
+	}, http.MethodPost, "/v1/users", `{"name":"Alice","email":"alice@example.com"}`)
+	if publisherFailure.Code != http.StatusServiceUnavailable {
+		t.Fatalf("publisher status = %d", publisherFailure.Code)
 	}
 }
 

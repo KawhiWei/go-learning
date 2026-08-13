@@ -1,12 +1,14 @@
 services:
   db:
-    image: postgres:16-alpine
+    image: postgres:12.18
     environment:
       POSTGRES_DB: nino
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "51432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d nino"]
       interval: 5s
@@ -14,7 +16,7 @@ services:
       retries: 10
 
   migrate:
-    image: postgres:16-alpine
+    image: postgres:12.18
     depends_on:
       db:
         condition: service_healthy
@@ -24,14 +26,56 @@ services:
       - ./migrations:/migrations:ro
     command: ["sh", "-c", "psql \"$${DATABASE_URL}\" -v ON_ERROR_STOP=1 -f /migrations/001_create_users.sql"]
 
+  kafka:
+    image: apache/kafka:3.9.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  kafka-init:
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - /bin/bash
+      - -ec
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic user-events --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic audit-events --partitions 3 --replication-factor 1
+
   api:
     build: .
     environment:
       NINO_CONFIG_PATH: /app/configs/app.yaml
       NINO_DATABASE_URL: postgres://postgres:postgres@db:5432/nino?sslmode=disable
       NINO_HTTP_ADDR: :8080
+      NINO_KAFKA_ENABLED: "true"
+      NINO_KAFKA_BROKERS: kafka:9092
+      NINO_KAFKA_TOPICS: user-events,audit-events
+      NINO_KAFKA_CLIENT_ID: nino-data-api
     depends_on:
       migrate:
+        condition: service_completed_successfully
+      kafka-init:
         condition: service_completed_successfully
     ports:
       - "8080:8080"
@@ -40,6 +84,30 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  work:
+    build: .
+    container_name: nino-data-work
+    entrypoint: ["/app/work"]
+    environment:
+      NINO_CONFIG_PATH: /app/configs/app.yaml
+      NINO_DATABASE_URL: postgres://postgres:postgres@db:5432/nino?sslmode=disable
+      NINO_KAFKA_ENABLED: "true"
+      NINO_KAFKA_BROKERS: kafka:9092
+      NINO_KAFKA_GROUP_ID: nino-data-work
+      NINO_KAFKA_TOPICS: user-events,audit-events
+      NINO_KAFKA_CLIENT_ID: nino-data-work
+      NINO_KAFKA_RETRY_INTERVAL_SECS: "2"
+      NINO_KAFKA_WORKER_CONCURRENCY: "8"
+      NINO_KAFKA_POLL_MAX_RECORDS: "100"
+      NINO_KAFKA_SHUTDOWN_TIMEOUT_SECS: "30"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 35s
 
   grpc:
     build: .
@@ -61,3 +129,4 @@ services:
 
 volumes:
   postgres-data:
+  kafka-data:

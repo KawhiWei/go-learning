@@ -4,8 +4,6 @@ import (
 	"context"
 	"net"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	// 通过 init hook 注册 Kitex gzip protobuf codec。blank import 让压缩的
@@ -21,6 +19,15 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		os.Exit(1)
+	}
+}
+
+// run 负责完整的进程生命周期。把实际启动逻辑放在独立函数中，可以保证
+// rpcServer.Run 返回错误时先执行 defer 释放数据库连接池，之后 main 再用
+// 非零状态码退出进程。
+func run() error {
 	log := logger.New(os.Getenv("NINO_LOG_LEVEL"))
 	configPath := os.Getenv("NINO_CONFIG_PATH")
 	if configPath == "" {
@@ -29,23 +36,22 @@ func main() {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		log.Error("load config", "error", err)
-		os.Exit(1)
+		return err
 	}
 	log = logger.New(cfg.Logger.Level)
 	addr, err := net.ResolveTCPAddr("tcp", cfg.GRPC.Addr)
 	if err != nil {
 		log.Error("resolve kitex address", "error", err)
-		os.Exit(1)
+		return err
 	}
 
 	// 两个入口使用同一套装配规则，但每个进程各自创建并持有自己的 pool 和
-	// UserService。本入口只围绕这些依赖协调 Kitex 的启动与优雅关闭。
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	application, err := composition.New(ctx, cfg)
+	// UserService。Run 返回后再关闭 application，避免进行中的 RPC 观察到已
+	// 关闭的数据库连接池。
+	application, err := composition.New(context.Background(), cfg)
 	if err != nil {
 		log.Error("initialize application", "error", err)
-		os.Exit(1)
+		return err
 	}
 	defer application.Close()
 
@@ -54,24 +60,12 @@ func main() {
 		kitexserver.WithServiceAddr(addr),
 		kitexserver.WithExitWaitTime(10*time.Second),
 	)
-	serverErr := make(chan error, 1)
-	go func() {
-		log.Info("kitex grpc server listening", "addr", cfg.GRPC.Addr)
-		serverErr <- rpcServer.Run()
-	}()
-
-	select {
-	case err := <-serverErr:
-		if err != nil {
-			log.Error("kitex grpc server stopped", "error", err)
-			application.Close()
-			os.Exit(1)
-		}
-	case <-ctx.Done():
-		// Stop 让 Kitex 排空进行中的请求；之后才执行 App.Close，避免 handler
-		// 仍在工作时观察到已关闭的 pool。
-		if err := rpcServer.Stop(); err != nil {
-			log.Error("shutdown kitex grpc server", "error", err)
-		}
+	log.Info("kitex grpc server listening", "addr", cfg.GRPC.Addr)
+	// Kitex Run 是阻塞调用，内部负责监听退出信号、停止接收新请求并执行
+	// graceful Stop；入口不再重复维护 signal channel 或手动调用 Stop。
+	if err := rpcServer.Run(); err != nil {
+		log.Error("run kitex grpc server", "error", err)
+		return err
 	}
+	return nil
 }

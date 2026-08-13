@@ -17,7 +17,8 @@ func RegisterHTTPRoutes(server *hertz.Hertz, services HTTPServices) {
 		c.String(consts.StatusOK, "ok\n")
 	})
 
-	registerUserRoutes(server, services.User)
+	registerUserRoutes(server, services.User, services.Publisher)
+	registerEventRoutes(server, services.Event)
 
 	server.GET("/openapi.yaml", func(_ context.Context, c *app.RequestContext) {
 		c.Data(consts.StatusOK, "application/yaml; charset=utf-8", openapi.Spec)

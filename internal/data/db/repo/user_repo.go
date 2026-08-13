@@ -25,6 +25,7 @@ func (r *UserRepository) Create(ctx context.Context, user *biz.User) (*biz.User,
 	const query = `
 		INSERT INTO users (id, name, email)
 		VALUES ($1, $2, $3)
+		ON CONFLICT (id) DO NOTHING
 		RETURNING id, name, email, created_at`
 
 	stored := toUserModel(user)
@@ -35,6 +36,19 @@ func (r *UserRepository) Create(ctx context.Context, user *biz.User) (*biz.User,
 	err := r.pool.QueryRow(ctx, query, stored.ID, stored.Name, stored.Email).Scan(
 		&created.ID, &created.Name, &created.Email, &created.CreatedAt,
 	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// 同一 Kafka 事件可能在 Handler 成功但 offset 提交前重投。相同 ID、
+		// 相同内容表示上一次写入已经成功，可以作为幂等成功返回；相同 ID
+		// 不同内容则是数据冲突，不能静默覆盖。
+		existing, getErr := r.Get(ctx, stored.ID)
+		if getErr != nil {
+			return nil, getErr
+		}
+		if existing.Name == stored.Name && existing.Email == stored.Email {
+			return existing, nil
+		}
+		return nil, biz.ErrAlreadyExists
+	}
 	if err != nil {
 		if isUniqueViolation(err) {
 			return nil, biz.ErrAlreadyExists

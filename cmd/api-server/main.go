@@ -26,9 +26,9 @@ func main() {
 	}
 	log = logger.New(cfg.Logger.Level)
 
-	// App.New 负责本进程唯一一次的 database pool 装配；Hertz Spin 负责
-	// HTTP server 的信号监听和优雅关闭。
-	application, err := composition.New(context.Background(), cfg)
+	// NewAPI 只创建 Kafka Producer；独立 work 进程负责消费消息，因此 API
+	// 不加入 Consumer Group，也不会运行后台消费 goroutine。
+	application, err := composition.NewAPI(context.Background(), cfg, log)
 	if err != nil {
 		log.Error("initialize application", "error", err)
 		os.Exit(1)
@@ -40,7 +40,11 @@ func main() {
 		hertz.WithMaxRequestBodySize(1<<20),
 		hertz.WithExitWaitTime(10*time.Second),
 	)
-	appserver.RegisterHTTPRoutes(httpServer, appserver.HTTPServices{User: application.Services.UserService})
+	appserver.RegisterHTTPRoutes(httpServer, appserver.HTTPServices{
+		User:      application.Services.UserService,
+		Publisher: application.Services.MessagePublisher,
+		Event:     application.Services.EventService,
+	})
 
 	log.Info("hertz http server listening", "addr", cfg.HTTP.Addr)
 	httpServer.Spin()

@@ -1,14 +1,47 @@
 openapi: 3.0.3
 info:
-  title: nino user API
+  title: nino data API
   version: 1.0.0
-  description: HTTP API for creating and retrieving users.
+  description: HTTP API for users and reliable Kafka event publishing.
 servers:
   - url: http://localhost:8080
 paths:
+  /v1/events/{topic}:
+    post:
+      operationId: publishEvent
+      summary: Publish an event to an allowed Kafka topic
+      description: System command topics such as user-events are not accepted here; use POST /v1/users.
+      parameters:
+        - name: topic
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublishEventRequest'
+      responses:
+        '202':
+          description: Kafka acknowledged the event. Worker processing may still be pending.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublishEventResponse'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '503':
+          description: Kafka did not acknowledge the event before the request deadline.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /v1/users:
     post:
       operationId: createUser
+      summary: Queue an asynchronous user creation message
       requestBody:
         required: true
         content:
@@ -16,16 +49,20 @@ paths:
             schema:
               $ref: '#/components/schemas/CreateUserRequest'
       responses:
-        '201':
-          description: User created.
+        '202':
+          description: Kafka acknowledged the message. Database insertion may still be pending.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/User'
+                $ref: '#/components/schemas/PublishAccepted'
         '400':
           $ref: '#/components/responses/InvalidArgument'
-        '409':
-          $ref: '#/components/responses/AlreadyExists'
+        '503':
+          description: Kafka did not acknowledge the message before the request deadline.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /v1/users/{id}:
     get:
       operationId: getUser
@@ -49,6 +86,31 @@ paths:
           $ref: '#/components/responses/NotFound'
 components:
   schemas:
+    PublishEventRequest:
+      type: object
+      required: [payload]
+      properties:
+        key:
+          type: string
+          description: Kafka key used for stable partition selection.
+        payload:
+          description: JSON event payload.
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: array
+            - type: string
+            - type: number
+            - type: boolean
+    PublishEventResponse:
+      type: object
+      required: [status, topic]
+      properties:
+        status:
+          type: string
+          example: accepted
+        topic:
+          type: string
     CreateUserRequest:
       type: object
       required: [name, email]
@@ -60,6 +122,19 @@ components:
           type: string
           format: email
           maxLength: 320
+    PublishAccepted:
+      type: object
+      required: [message_id, resource_id, status]
+      properties:
+        message_id:
+          type: string
+          format: uuid
+        resource_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [accepted]
     User:
       type: object
       required: [id, name, email, created_at]

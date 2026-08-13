@@ -21,10 +21,25 @@ func (f *fakeUserRepository) Create(_ context.Context, user *User) (*User, error
 		return nil, f.createErr
 	}
 	copy := *user
-	copy.ID = uuid.New()
+	if copy.ID == uuid.Nil {
+		copy.ID = uuid.New()
+	}
 	copy.CreatedAt = time.Unix(1, 0).UTC()
 	f.created = &copy
 	return &copy, nil
+}
+
+func TestCreateUserWithIDPreservesEventIdentity(t *testing.T) {
+	repo := &fakeUserRepository{}
+	service := NewUserService(repo)
+	id := uuid.New()
+	user, err := service.CreateUserWithID(context.Background(), id, "Alice", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.ID != id || repo.created.ID != id {
+		t.Fatalf("user ID = %s, repository ID = %s, want %s", user.ID, repo.created.ID, id)
+	}
 }
 
 func (f *fakeUserRepository) Get(_ context.Context, _ uuid.UUID) (*User, error) {

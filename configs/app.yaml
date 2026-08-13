@@ -7,5 +7,16 @@ database:
   max_conns: 10
   min_conns: 2
   health_check_seconds: 30
+kafka:
+  enabled: false
+  brokers: []
+  group_id: "nino-data-work"
+  topics: []
+  client_id: "nino-data"
+  retry_interval_seconds: 5
+  publish_timeout_seconds: 10
+  worker_concurrency: 8
+  poll_max_records: 100
+  shutdown_timeout_seconds: 30
 logger:
   level: info
