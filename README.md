@@ -358,7 +358,7 @@ gRPC Method -> Kitex Handler┘                         |
 
 ## 本地启动
 
-要求 Go 1.23+、PostgreSQL 14+。先创建数据库并执行迁移：
+要求 Go 1.26+、PostgreSQL 14+。先创建数据库并执行迁移：
 
 ```sh
 createdb nino

@@ -47,7 +47,7 @@ func run() error {
 	defer consumer.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	defer stop() // 后进先出
 	log.Info("kafka consumer started",
 		"group_id", cfg.Kafka.GroupID,
 		"topics", cfg.Kafka.Topics,
