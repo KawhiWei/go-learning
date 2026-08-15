@@ -8,8 +8,9 @@ import (
 	hertz "github.com/cloudwego/hertz/pkg/app/server"
 
 	composition "github.com/luck/go-learning/internal/app"
+	"github.com/luck/go-learning/internal/biz"
 	"github.com/luck/go-learning/internal/config"
-	appserver "github.com/luck/go-learning/internal/server"
+	httpserver "github.com/luck/go-learning/internal/server/http"
 	"github.com/luck/go-learning/pkg/logger"
 )
 
@@ -26,21 +27,24 @@ func main() {
 	}
 	log = logger.New(cfg.Logger.Level)
 
-	// NewAPI 只创建 Kafka Producer；独立 work 进程负责消费消息，因此 API
-	// 不加入 Consumer Group，也不会运行后台消费 goroutine。
-	application, err := composition.NewAPI(context.Background(), cfg, log)
+	// HTTP API 只启用 Kafka Producer；独立 Consumer 进程负责消费消息。
+	application, err := composition.New(
+		context.Background(), cfg,
+		composition.WithKafkaProducer(log),
+		composition.RequireKafkaTopics(biz.UserCreateTopic),
+	)
 	if err != nil {
 		log.Error("initialize application", "error", err)
 		os.Exit(1)
 	}
 	defer application.Close()
 
-	httpServer := appserver.NewHTTPServer(
+	httpServer := httpserver.NewHTTPServer(
 		hertz.WithHostPorts(cfg.HTTP.Addr),
 		hertz.WithMaxRequestBodySize(1<<20),
 		hertz.WithExitWaitTime(10*time.Second),
 	)
-	appserver.RegisterHTTPRoutes(httpServer, appserver.HTTPServices{
+	httpserver.RegisterHTTPRoutes(httpServer, httpserver.HTTPServices{
 		User:      application.Services.UserService,
 		Publisher: application.Services.MessagePublisher,
 		Event:     application.Services.EventService,

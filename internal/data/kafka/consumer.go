@@ -11,6 +11,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/luck/go-learning/internal/config"
+	"github.com/luck/go-learning/internal/consumer"
 )
 
 type consumerClient interface {
@@ -21,26 +22,26 @@ type consumerClient interface {
 }
 
 // Consumer 以一次有界 poll 为处理批次。
-// 不同 partition 可以并发处理；同一 partition 的 records 始终由一个 worker 按 offset 顺序处理。
+// 不同 partition 可以并发处理；同一 partition 的 records 始终由一个处理 goroutine 按 offset 顺序处理。
 //
 // 每个批次包含三类 goroutine：
 //   - 调用 processBatch 的主 goroutine：收集处理结果，并决定哪些 offset 可以提交。
-//   - 固定数量的 worker goroutine：从 jobs channel 领取一个 partition 的全部 records，并顺序调用 Handler。
-//   - 一个 dispatcher goroutine：发送 partition job，关闭 jobs，等待全部 worker 退出，最后关闭 results。
+//   - 固定数量的处理 goroutine：从 jobs channel 领取一个 partition 的全部 records，并顺序调用 Handler。
+//   - 一个 dispatcher goroutine：发送 partition job，关闭 jobs，等待全部处理 goroutine 退出，最后关闭 results。
 //
 // 这些 goroutine 只在当前批次内存活，不会跨 PollRecords 调用复用或累积。
 type Consumer struct {
 	client          consumerClient
-	router          *Router
+	router          consumer.TopicRouter
 	retryInterval   time.Duration
 	shutdownTimeout time.Duration
-	workerCount     int
+	concurrency     int
 	pollMaxRecords  int
 	log             *slog.Logger
 	closeOnce       sync.Once
 }
 
-func NewConsumer(cfg config.KafkaConfig, router *Router, log *slog.Logger) (*Consumer, error) {
+func NewConsumer(cfg config.KafkaConfig, router consumer.TopicRouter, log *slog.Logger) (*Consumer, error) {
 	if router == nil {
 		return nil, errors.New("kafka router must not be nil")
 	}
@@ -64,7 +65,7 @@ func NewConsumer(cfg config.KafkaConfig, router *Router, log *slog.Logger) (*Con
 	return newConsumer(client, cfg, router, log), nil
 }
 
-func newConsumer(client consumerClient, cfg config.KafkaConfig, router *Router, log *slog.Logger) *Consumer {
+func newConsumer(client consumerClient, cfg config.KafkaConfig, router consumer.TopicRouter, log *slog.Logger) *Consumer {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -72,7 +73,7 @@ func newConsumer(client consumerClient, cfg config.KafkaConfig, router *Router, 
 		client: client, router: router, log: log,
 		retryInterval:   time.Duration(cfg.RetryIntervalSecs) * time.Second,
 		shutdownTimeout: time.Duration(cfg.ShutdownTimeoutSecs) * time.Second,
-		workerCount:     cfg.WorkerConcurrency, pollMaxRecords: cfg.PollMaxRecords,
+		concurrency:     cfg.ConsumerConcurrency, pollMaxRecords: cfg.PollMaxRecords,
 	}
 }
 
@@ -106,7 +107,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 				err = commitErr
 			}
 		}
-		// processBatch 和 commitWithRetry 返回后，批次内 worker 已全部退出，此时取消监督 goroutine 是安全的。
+		// processBatch 和 commitWithRetry 返回后，批次内处理 goroutine 已全部退出，此时取消监督 goroutine 是安全的。
 		finishBatch()
 		// offset 处理结束后再允许 rebalance，避免分区在 Handler 运行期间被转交给其他 Consumer。
 		c.client.AllowRebalance()
@@ -145,30 +146,30 @@ func (c *Consumer) processBatch(ctx context.Context, records []*kgo.Record) ([]*
 		key := partitionKey{topic: record.Topic, partition: record.Partition}
 		grouped[key] = append(grouped[key], record)
 	}
-	workers := c.workerCount
-	if workers < 1 {
-		workers = 1
+	concurrency := c.concurrency
+	if concurrency < 1 {
+		concurrency = 1
 	}
-	if workers > len(grouped) {
-		workers = len(grouped)
+	if concurrency > len(grouped) {
+		concurrency = len(grouped)
 	}
-	// 实际 worker goroutine 数取 min(worker_concurrency, 当前批次包含的 partition 数)。
-	// worker_concurrency 高于 partition 数不会增加并行度，因为同一 partition 不能拆给多个 worker。
-	// Handler 访问数据库时，worker_concurrency 通常不应高于 DB max_conns，并且还要为其他数据库操作预留连接。
-	// jobs 不设置缓冲，使 dispatcher 只在某个 worker 准备好接收时才继续发送，避免预先堆积重复的任务引用。
+	// 实际处理 goroutine 数取 min(consumer_concurrency, 当前批次包含的 partition 数)。
+	// consumer_concurrency 高于 partition 数不会增加并行度，因为同一 partition 不能拆给多个 goroutine。
+	// Handler 访问数据库时，consumer_concurrency 通常不应高于 DB max_conns，并且还要为其他数据库操作预留连接。
+	// jobs 不设置缓冲，使 dispatcher 只在某个处理 goroutine 准备好接收时才继续发送，避免预先堆积重复的任务引用。
 	jobs := make(chan partitionJob)
-	// 每个 partition 最多产生一个结果。缓冲区容量等于 partition 数，可以保证 worker 上报结果时不会等待主 goroutine 开始读取。
+	// 每个 partition 最多产生一个结果。缓冲区容量等于 partition 数，可以保证处理 goroutine 上报结果时不会等待主 goroutine 开始读取。
 	results := make(chan partitionResult, len(grouped))
 	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
+	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func() {
-			// 每个 worker goroutine 只在当前 poll 批次存活，并在 jobs 关闭且队列耗尽后退出。
-			// Done 放在 defer 中，确保 worker 无论从哪个正常路径返回，dispatcher 都能观察到它已经结束。
+			// 每个处理 goroutine 只在当前 poll 批次存活，并在 jobs 关闭且队列耗尽后退出。
+			// Done 放在 defer 中，确保处理 goroutine 无论从哪个正常路径返回，dispatcher 都能观察到它已经结束。
 			defer wg.Done()
 			for job := range jobs {
 				// 一个 job 只包含同一 Topic+Partition 的消息，因此这个循环天然保持 offset 顺序。
-				// 当前消息持续失败时，handleWithRetry 会阻塞这个 partition，但不会阻止其他 worker 处理其他 partition。
+				// 当前消息持续失败时，handleWithRetry 会阻塞这个 partition，但不会阻止其他处理 goroutine 处理其他 partition。
 				var err error
 				for _, record := range job.records {
 					if err = c.handleWithRetry(ctx, record); err != nil {
@@ -180,7 +181,7 @@ func (c *Consumer) processBatch(ctx context.Context, records []*kgo.Record) ([]*
 					// 只有整个 partition job 全部成功时才返回最后一条 record，防止越过中间失败的 offset。
 					result.last = job.records[len(job.records)-1]
 				}
-				// results 有足够容量容纳所有 partition 的结果，因此 worker 不会在此处与结果收集形成循环等待。
+				// results 有足够容量容纳所有 partition 的结果，因此处理 goroutine 不会在此处与结果收集形成循环等待。
 				results <- result
 			}
 		}()
@@ -190,9 +191,9 @@ func (c *Consumer) processBatch(ctx context.Context, records []*kgo.Record) ([]*
 		for _, partitionRecords := range grouped {
 			jobs <- partitionJob{records: partitionRecords}
 		}
-		// 关闭 jobs 告诉 worker 不会再有新任务；已经发送的任务仍会处理完。
+		// 关闭 jobs 告诉处理 goroutine 不会再有新任务；已经发送的任务仍会处理完。
 		close(jobs)
-		// 必须等待所有 worker 停止写 results，才能关闭 results，否则 worker 可能向已关闭的 channel 发送并触发 panic。
+		// 必须等待所有处理 goroutine 停止写 results，才能关闭 results，否则可能向已关闭的 channel 发送并触发 panic。
 		wg.Wait()
 		// 主 goroutine 使用 range 读取 results；关闭 channel 是通知它“所有 partition 都已返回结果”的唯一结束信号。
 		close(results)
@@ -200,7 +201,7 @@ func (c *Consumer) processBatch(ctx context.Context, records []*kgo.Record) ([]*
 
 	committable := make([]*kgo.Record, 0, len(grouped))
 	var firstErr error
-	// 当前 goroutine 持续读取 results，直到 dispatcher 在所有 worker 退出后关闭 channel。
+	// 当前 goroutine 持续读取 results，直到 dispatcher 在所有处理 goroutine 退出后关闭 channel。
 	// 成功 partition 的最后一条 record 可以提交；失败 partition 不加入 committable，因此不会推进它的 offset。
 	for result := range results {
 		if result.err != nil && firstErr == nil {
@@ -216,7 +217,7 @@ func (c *Consumer) processBatch(ctx context.Context, records []*kgo.Record) ([]*
 func (c *Consumer) handleWithRetry(ctx context.Context, record *kgo.Record) error {
 	message := toMessage(record)
 	for {
-		// 重试发生在负责该 partition 的 worker goroutine 内，所以重试期间仍然保持分区顺序。
+		// 重试发生在负责该 partition 的处理 goroutine 内，所以重试期间仍然保持分区顺序。
 		if err := c.router.Handle(ctx, message); err != nil {
 			c.log.Error("handle kafka message", "topic", record.Topic, "partition", record.Partition,
 				"offset", record.Offset, "key_size", len(record.Key), "value_size", len(record.Value), "error", err)
@@ -277,12 +278,12 @@ func batchContext(signalCtx context.Context, timeout time.Duration) (context.Con
 	return ctx, cancel
 }
 
-func toMessage(record *kgo.Record) Message {
+func toMessage(record *kgo.Record) consumer.Message {
 	headers := make(map[string][]byte, len(record.Headers))
 	for _, header := range record.Headers {
 		headers[header.Key] = append([]byte(nil), header.Value...)
 	}
-	return Message{Topic: record.Topic, Partition: record.Partition, Offset: record.Offset,
+	return consumer.Message{Topic: record.Topic, Partition: record.Partition, Offset: record.Offset,
 		Key: append([]byte(nil), record.Key...), Value: append([]byte(nil), record.Value...),
 		Headers: headers, Timestamp: record.Timestamp}
 }

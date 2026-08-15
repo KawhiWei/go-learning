@@ -1,4 +1,4 @@
-package server
+package httpserver
 
 import (
 	"context"
@@ -164,7 +164,7 @@ func TestHTTPRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
-func TestHTTPMapsAsyncUserCommandErrors(t *testing.T) {
+func TestHTTPMapsAsyncUserMessageErrors(t *testing.T) {
 	invalid := performRequest(&fakeHTTPService{}, http.MethodPost, "/v1/users", `{"name":"","email":"alice@example.com"}`)
 	if invalid.Code != http.StatusBadRequest {
 		t.Fatalf("invalid status = %d", invalid.Code)

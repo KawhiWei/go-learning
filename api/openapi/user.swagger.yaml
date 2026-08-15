@@ -25,7 +25,7 @@ paths:
               $ref: '#/components/schemas/PublishEventRequest'
       responses:
         '202':
-          description: Kafka acknowledged the event. Worker processing may still be pending.
+          description: Kafka acknowledged the event. Consumer processing may still be pending.
           content:
             application/json:
               schema:

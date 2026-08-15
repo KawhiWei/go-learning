@@ -1,4 +1,4 @@
-package server
+package grpcserver
 
 import (
 	"context"
@@ -13,8 +13,36 @@ import (
 	"github.com/luck/go-learning/internal/biz"
 )
 
+type fakeGRPCService struct {
+	createErr error
+	getErr    error
+	got       *biz.User
+}
+
+func (f *fakeGRPCService) CreateUser(context.Context, string, string) (*biz.User, error) {
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
+	if f.got != nil {
+		return f.got, nil
+	}
+	return &biz.User{
+		ID:        uuid.New(),
+		Name:      "Alice",
+		Email:     "alice@example.com",
+		CreatedAt: time.Unix(1, 0).UTC(),
+	}, nil
+}
+
+func (f *fakeGRPCService) GetUser(context.Context, uuid.UUID) (*biz.User, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	return f.got, nil
+}
+
 func TestKitexCreateUser(t *testing.T) {
-	user, err := NewKitexUserServer(&fakeHTTPService{}).CreateUser(
+	user, err := RegisterKitexUserServer(&fakeGRPCService{}).CreateUser(
 		context.Background(),
 		&gen.CreateUserRequest{Name: "Alice", Email: "alice@example.com"},
 	)
@@ -41,7 +69,7 @@ func TestKitexMapsGRPCErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := NewKitexUserServer(&fakeHTTPService{createErr: tc.err}).CreateUser(
+			_, err := RegisterKitexUserServer(&fakeGRPCService{createErr: tc.err}).CreateUser(
 				context.Background(),
 				&gen.CreateUserRequest{},
 			)
@@ -53,7 +81,7 @@ func TestKitexMapsGRPCErrors(t *testing.T) {
 }
 
 func TestKitexGetUserValidatesID(t *testing.T) {
-	kitexServer := NewKitexUserServer(&fakeHTTPService{})
+	kitexServer := RegisterKitexUserServer(&fakeGRPCService{})
 	for _, req := range []*gen.GetUserRequest{nil, {}, {Id: "not-a-uuid"}} {
 		if _, err := kitexServer.GetUser(context.Background(), req); status.Code(err) != codes.InvalidArgument {
 			t.Fatalf("GetUser(%v) error = %v, want InvalidArgument", req, err)
@@ -61,10 +89,10 @@ func TestKitexGetUserValidatesID(t *testing.T) {
 	}
 
 	id := uuid.New()
-	service := &fakeHTTPService{got: &biz.User{
+	service := &fakeGRPCService{got: &biz.User{
 		ID: id, Name: "Alice", Email: "alice@example.com", CreatedAt: time.Unix(1, 0).UTC(),
 	}}
-	user, err := NewKitexUserServer(service).GetUser(
+	user, err := RegisterKitexUserServer(service).GetUser(
 		context.Background(),
 		&gen.GetUserRequest{Id: id.String()},
 	)

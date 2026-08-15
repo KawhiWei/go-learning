@@ -11,44 +11,66 @@ import (
 )
 
 type Config struct {
-	HTTP     HTTPConfig     `yaml:"http"`
-	GRPC     GRPCConfig     `yaml:"grpc"`
+	// HTTP 是 Hertz HTTP 服务的监听配置。
+	HTTP HTTPConfig `yaml:"http"`
+	// GRPC 是 Kitex RPC 服务的监听配置。
+	GRPC GRPCConfig `yaml:"grpc"`
+	// Database 是 PostgreSQL 连接池配置，供每个进程独立创建连接池。
 	Database DatabaseConfig `yaml:"database"`
-	Kafka    KafkaConfig    `yaml:"kafka"`
-	Logger   LoggerConfig   `yaml:"logger"`
+	// Kafka 是 Producer 与 Consumer 可复用的 Kafka 基础设施配置。
+	Kafka KafkaConfig `yaml:"kafka"`
+	// Logger 控制进程日志输出级别。
+	Logger LoggerConfig `yaml:"logger"`
 }
 
 type HTTPConfig struct {
+	// Addr 是 Hertz 监听地址，例如 ":8080"。
 	Addr string `yaml:"addr"`
 }
 
 type GRPCConfig struct {
+	// Addr 是 Kitex 监听地址，例如 ":9090"。
 	Addr string `yaml:"addr"`
 }
 
 type DatabaseConfig struct {
-	URL             string `yaml:"url"`
-	MaxConns        int32  `yaml:"max_conns"`
-	MinConns        int32  `yaml:"min_conns"`
-	HealthCheckSecs int    `yaml:"health_check_seconds"`
+	// URL 是 pgx 使用的 PostgreSQL 连接串。
+	URL string `yaml:"url"`
+	// MaxConns 是单个进程允许数据库连接池创建的最大连接数。
+	MaxConns int32 `yaml:"max_conns"`
+	// MinConns 是连接池保持的最小空闲连接数，必须不大于 MaxConns。
+	MinConns int32 `yaml:"min_conns"`
+	// HealthCheckSecs 是连接池检查空闲连接健康状态的间隔，单位为秒。
+	HealthCheckSecs int `yaml:"health_check_seconds"`
 }
 
-// KafkaConfig 描述 API Producer 与 work Consumer 共用的连接配置，以及
-// Worker 的消费组、并发、重试和关闭参数。
+// KafkaConfig 描述 Producer 与 Consumer 共用的连接配置，以及
+// Consumer 的消费组、并发、重试和关闭参数。
 type KafkaConfig struct {
-	Enabled             bool     `yaml:"enabled"`
-	Brokers             []string `yaml:"brokers"`
-	GroupID             string   `yaml:"group_id"`
-	Topics              []string `yaml:"topics"`
-	ClientID            string   `yaml:"client_id"`
-	RetryIntervalSecs   int      `yaml:"retry_interval_seconds"`
-	PublishTimeoutSecs  int      `yaml:"publish_timeout_seconds"`
-	WorkerConcurrency   int      `yaml:"worker_concurrency"`
-	PollMaxRecords      int      `yaml:"poll_max_records"`
-	ShutdownTimeoutSecs int      `yaml:"shutdown_timeout_seconds"`
+	// Enabled 控制进程是否允许创建 Kafka 客户端。
+	Enabled bool `yaml:"enabled"`
+	// Brokers 是 Kafka broker 地址列表，例如 kafka:9092。
+	Brokers []string `yaml:"brokers"`
+	// GroupID 是 Consumer 所属消费组；Producer 不使用该字段。
+	GroupID string `yaml:"group_id"`
+	// Topics 是 Producer 可发布且 Consumer 应订阅的 Topic 白名单。
+	Topics []string `yaml:"topics"`
+	// ClientID 是 franz-go 客户端标识，便于 broker 日志和监控区分实例。
+	ClientID string `yaml:"client_id"`
+	// RetryIntervalSecs 是 Consumer 处理或提交失败后重试的等待时间，单位为秒。
+	RetryIntervalSecs int `yaml:"retry_interval_seconds"`
+	// PublishTimeoutSecs 是 Producer 等待 broker 确认一条消息的最长时间，单位为秒。
+	PublishTimeoutSecs int `yaml:"publish_timeout_seconds"`
+	// ConsumerConcurrency 是一个 poll 批次中可并发处理的最大 partition 数。
+	ConsumerConcurrency int `yaml:"consumer_concurrency"`
+	// PollMaxRecords 是 Consumer 单次 PollRecords 最多获取的消息数。
+	PollMaxRecords int `yaml:"poll_max_records"`
+	// ShutdownTimeoutSecs 是收到退出信号后排空在途任务和提交 offset 的最长时间，单位为秒。
+	ShutdownTimeoutSecs int `yaml:"shutdown_timeout_seconds"`
 }
 
 type LoggerConfig struct {
+	// Level 是结构化日志的最小输出级别，例如 debug、info、warn 或 error。
 	Level string `yaml:"level"`
 }
 
@@ -64,11 +86,11 @@ func Default() Config {
 		},
 		Kafka: KafkaConfig{
 			Enabled:             false,
-			GroupID:             "nino-data-work",
+			GroupID:             "nino-data-consumer",
 			ClientID:            "nino-data",
 			RetryIntervalSecs:   5,
 			PublishTimeoutSecs:  10,
-			WorkerConcurrency:   8,
+			ConsumerConcurrency: 8,
 			PollMaxRecords:      100,
 			ShutdownTimeoutSecs: 30,
 		},
@@ -134,8 +156,8 @@ func (c Config) Validate() error {
 		if c.Kafka.PublishTimeoutSecs < 1 {
 			return errors.New("kafka.publish_timeout_seconds must be at least 1 when kafka is enabled")
 		}
-		if c.Kafka.WorkerConcurrency < 1 {
-			return errors.New("kafka.worker_concurrency must be at least 1 when kafka is enabled")
+		if c.Kafka.ConsumerConcurrency < 1 {
+			return errors.New("kafka.consumer_concurrency must be at least 1 when kafka is enabled")
 		}
 		if c.Kafka.PollMaxRecords < 1 {
 			return errors.New("kafka.poll_max_records must be at least 1 when kafka is enabled")
@@ -193,7 +215,7 @@ func applyEnv(c *Config) {
 		c.Kafka.ClientID = strings.TrimSpace(value)
 	}
 	applyPositiveIntEnv(&c.Kafka.PublishTimeoutSecs, "NINO_KAFKA_PUBLISH_TIMEOUT_SECS")
-	applyPositiveIntEnv(&c.Kafka.WorkerConcurrency, "NINO_KAFKA_WORKER_CONCURRENCY")
+	applyPositiveIntEnv(&c.Kafka.ConsumerConcurrency, "NINO_KAFKA_CONSUMER_CONCURRENCY")
 	applyPositiveIntEnv(&c.Kafka.PollMaxRecords, "NINO_KAFKA_POLL_MAX_RECORDS")
 	applyPositiveIntEnv(&c.Kafka.ShutdownTimeoutSecs, "NINO_KAFKA_SHUTDOWN_TIMEOUT_SECS")
 	c.Kafka.Brokers = normalizeList(c.Kafka.Brokers)

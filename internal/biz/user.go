@@ -19,9 +19,13 @@ var (
 
 // User is the application representation of a user.
 type User struct {
-	ID        uuid.UUID
-	Name      string
-	Email     string
+	// ID 是用户的全局唯一标识；异步创建时由 Producer 预先生成以支持幂等。
+	ID uuid.UUID
+	// Name 是经业务规则校验和规范化后的用户名称。
+	Name string
+	// Email 是经业务规则校验和规范化后的唯一邮箱地址。
+	Email string
+	// CreatedAt 是数据库成功持久化该用户的时间。
 	CreatedAt time.Time
 }
 

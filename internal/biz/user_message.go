@@ -21,11 +21,16 @@ const (
 // encoding.TextMarshaler 行为。这样事件在不同语言的消费者之间仍有清晰、
 // 可读且长期稳定的 JSON 表示。
 type UserCreateMessage struct {
+	// MessageID 是本次创建请求的唯一事件 ID，用于链路追踪和幂等分析。
 	MessageID string `json:"message_id"`
-	UserID    string `json:"user_id"`
-	Type      string `json:"type"`
-	Name      string `json:"name"`
-	Email     string `json:"email"`
+	// UserID 是调用方预先生成的用户 ID，并且作为 Kafka key 保持同一用户顺序。
+	UserID string `json:"user_id"`
+	// Type 是版本化事件类型；Consumer 用它拒绝不兼容的消息格式。
+	Type string `json:"type"`
+	// Name 是已通过用户业务校验的展示名称。
+	Name string `json:"name"`
+	// Email 是已通过用户业务校验的唯一邮箱地址。
+	Email string `json:"email"`
 }
 
 // NewUserCreateMessage 只负责本业务校验和 ID 生成。返回的普通 struct 可直接

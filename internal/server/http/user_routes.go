@@ -1,4 +1,4 @@
-package server
+package httpserver
 
 import hertz "github.com/cloudwego/hertz/pkg/app/server"
 

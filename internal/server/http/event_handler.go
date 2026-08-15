@@ -1,4 +1,4 @@
-package server
+package httpserver
 
 import (
 	"bytes"
@@ -30,7 +30,7 @@ type EventHTTPHandler struct {
 }
 
 // Publish 在 broker 确认消息后返回 202。
-// 202 表示消息已经可靠交给 Kafka，不表示下游 Worker 已经完成业务处理。
+// 202 表示消息已经可靠交给 Kafka，不表示下游 Consumer 已经完成业务处理。
 func (h EventHTTPHandler) Publish(ctx context.Context, c *app.RequestContext) {
 	body, err := c.Body()
 	if err != nil || len(body) > maxJSONRequestBodySize {

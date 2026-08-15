@@ -14,7 +14,7 @@ import (
 	"github.com/luck/go-learning/api/gen/userservice"
 	composition "github.com/luck/go-learning/internal/app"
 	"github.com/luck/go-learning/internal/config"
-	appserver "github.com/luck/go-learning/internal/server"
+	grpcserver "github.com/luck/go-learning/internal/server/grpc"
 	"github.com/luck/go-learning/pkg/logger"
 )
 
@@ -56,7 +56,7 @@ func run() error {
 	defer application.Close()
 
 	rpcServer := userservice.NewServer(
-		appserver.NewKitexUserServer(application.Services.UserService),
+		grpcserver.RegisterKitexUserServer(application.Services.UserService),
 		kitexserver.WithServiceAddr(addr),
 		kitexserver.WithExitWaitTime(10*time.Second),
 	)

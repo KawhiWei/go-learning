@@ -12,6 +12,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/luck/go-learning/internal/config"
+	"github.com/luck/go-learning/internal/consumer"
 )
 
 type fakeConsumerClient struct {
@@ -41,9 +42,9 @@ func (f *fakeConsumerClient) CommitRecords(_ context.Context, records ...*kgo.Re
 func (f *fakeConsumerClient) AllowRebalance()         { f.allowed++ }
 func (f *fakeConsumerClient) CloseAllowingRebalance() { f.closed++ }
 
-func testConsumer(client consumerClient, router *Router, workers int) *Consumer {
+func testConsumer(client consumerClient, router consumer.TopicRouter, concurrency int) *Consumer {
 	cfg := config.Default().Kafka
-	cfg.WorkerConcurrency = workers
+	cfg.ConsumerConcurrency = concurrency
 	cfg.RetryIntervalSecs = 0
 	cfg.ShutdownTimeoutSecs = 1
 	return newConsumer(client, cfg, router, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -51,10 +52,10 @@ func testConsumer(client consumerClient, router *Router, workers int) *Consumer 
 
 func TestConsumerPreservesPartitionOrderAndCommitsLastOffsets(t *testing.T) {
 	client := &fakeConsumerClient{}
-	router := NewRouter()
+	router := consumer.NewRouter()
 	var mu sync.Mutex
 	got := map[int32][]int64{}
-	if err := router.Register("events", HandlerFunc(func(_ context.Context, message Message) error {
+	if err := router.Register("events", consumer.HandlerFunc(func(_ context.Context, message consumer.Message) error {
 		mu.Lock()
 		got[message.Partition] = append(got[message.Partition], message.Offset)
 		mu.Unlock()
@@ -81,10 +82,10 @@ func TestConsumerPreservesPartitionOrderAndCommitsLastOffsets(t *testing.T) {
 
 func TestConsumerProcessesPartitionsConcurrently(t *testing.T) {
 	client := &fakeConsumerClient{}
-	router := NewRouter()
+	router := consumer.NewRouter()
 	started := make(chan struct{}, 2)
 	release := make(chan struct{})
-	if err := router.Register("events", HandlerFunc(func(context.Context, Message) error {
+	if err := router.Register("events", consumer.HandlerFunc(func(context.Context, consumer.Message) error {
 		started <- struct{}{}
 		<-release
 		return nil
@@ -114,9 +115,9 @@ func TestConsumerProcessesPartitionsConcurrently(t *testing.T) {
 
 func TestCommitRetryDoesNotRunHandlerAgain(t *testing.T) {
 	client := &fakeConsumerClient{commitFailures: 1}
-	router := NewRouter()
+	router := consumer.NewRouter()
 	handled := 0
-	if err := router.Register("events", HandlerFunc(func(context.Context, Message) error { handled++; return nil })); err != nil {
+	if err := router.Register("events", consumer.HandlerFunc(func(context.Context, consumer.Message) error { handled++; return nil })); err != nil {
 		t.Fatal(err)
 	}
 	consumer := testConsumer(client, router, 1)
@@ -133,8 +134,8 @@ func TestCommitRetryDoesNotRunHandlerAgain(t *testing.T) {
 }
 
 func TestHandlerRetryCanBeCancelled(t *testing.T) {
-	router := NewRouter()
-	if err := router.Register("events", HandlerFunc(func(context.Context, Message) error { return errors.New("fail") })); err != nil {
+	router := consumer.NewRouter()
+	if err := router.Register("events", consumer.HandlerFunc(func(context.Context, consumer.Message) error { return errors.New("fail") })); err != nil {
 		t.Fatal(err)
 	}
 	consumer := testConsumer(&fakeConsumerClient{}, router, 1)
@@ -145,9 +146,17 @@ func TestHandlerRetryCanBeCancelled(t *testing.T) {
 	}
 }
 
+func TestWaitForRetryCanBeCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := waitForRetry(ctx, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForRetry error = %v", err)
+	}
+}
+
 func TestConsumerCloseIsIdempotent(t *testing.T) {
 	client := &fakeConsumerClient{}
-	consumer := testConsumer(client, NewRouter(), 1)
+	consumer := testConsumer(client, consumer.NewRouter(), 1)
 	consumer.Close()
 	consumer.Close()
 	if client.closed != 1 {

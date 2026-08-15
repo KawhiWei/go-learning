@@ -1,8 +1,7 @@
-package server
+package grpcserver
 
 import (
 	"context"
-	"errors"
 
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/codes"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/status"
@@ -13,11 +12,20 @@ import (
 	"github.com/luck/go-learning/internal/biz"
 )
 
+// UserService 是 gRPC transport 实际需要的最小业务边界。它只描述用例能力，
+// 不暴露 Repository、数据库连接或任何 Kitex 实现细节。
+type UserService interface {
+	CreateUser(context.Context, string, string) (*biz.User, error)
+	GetUser(context.Context, uuid.UUID) (*biz.User, error)
+}
+
 type KitexUserServer struct {
 	service UserService
 }
 
-func NewKitexUserServer(service UserService) *KitexUserServer {
+// RegisterKitexUserServer 构造 Proto UserService 的具体实现。真正的 Kitex
+// 服务注册由 api/gen/userservice.NewServer 内部的 RegisterService 完成。
+func RegisterKitexUserServer(service UserService) *KitexUserServer {
 	return &KitexUserServer{service: service}
 }
 
@@ -59,18 +67,5 @@ func toProtoUser(user *biz.User) *gen.User {
 		Name:      user.Name,
 		Email:     user.Email,
 		CreatedAt: timestamppb.New(user.CreatedAt),
-	}
-}
-
-func toKitexError(err error) error {
-	switch {
-	case errors.Is(err, biz.ErrInvalidArgument):
-		return status.Err(codes.InvalidArgument, err.Error())
-	case errors.Is(err, biz.ErrAlreadyExists):
-		return status.Err(codes.AlreadyExists, "user already exists")
-	case errors.Is(err, biz.ErrNotFound):
-		return status.Err(codes.NotFound, "user not found")
-	default:
-		return status.Err(codes.Internal, "internal server error")
 	}
 }

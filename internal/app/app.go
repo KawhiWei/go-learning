@@ -2,13 +2,11 @@
 //
 // 命令入口只处理启动、信号和关闭流程，不直接创建 repository。这样
 // transport 始终从同一个装配规则取得 service；新增业务模块时只需扩展
-// Services 以及 New 中的 wiring。
+// Services，并在对应进程的装配文件中完成 wiring。
 package app
 
 import (
 	"context"
-	"fmt"
-	"log/slog"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -25,9 +23,12 @@ import (
 // 这些用例，repository 仍是 composition root 的实现细节。未来模块完成
 // 业务层后再加入具体 service 字段，不为尚不存在的模块添加空占位。
 type Services struct {
-	UserService      *biz.UserService
+	// UserService 提供 HTTP、gRPC 和 Kafka Consumer Handler 共用的用户用例。
+	UserService *biz.UserService
+	// MessagePublisher 将业务消息编码并发布到配置允许的 Kafka Topic。
 	MessagePublisher *biz.MessagePublisher
-	EventService     *biz.EventService
+	// EventService 提供通用事件 Topic 的发布能力，不包含内部用户消息 Topic。
+	EventService *biz.EventService
 }
 
 // App 持有一个进程内各服务器共享的资源。
@@ -42,75 +43,28 @@ type App struct {
 	Services      Services
 }
 
-// New 是 composition root：按 database pool -> repository -> business service
-// 的依赖顺序完成装配。ctx 用于初次连接数据库，也可以被进程的 signal
-// handler 取消。
-func New(ctx context.Context, cfg config.Config) (*App, error) {
-	return newApp(ctx, cfg)
-}
+// Option 为进程附加一项可选基础设施能力。每个入口按实际职责组合选项，
+// 因此 Kafka Producer 可以被 HTTP、gRPC 或 Consumer 进程复用，而不必为
+// 每种组合创建新的 NewXXX 构造函数。
+type Option func(context.Context, config.Config, *App) error
 
-// NewAPI 在公共依赖之外创建 Kafka Producer。
-// API 只发布事件，不加入 Consumer Group；消息消费由独立 work 进程承担。
-func NewAPI(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error) {
+// New 是 composition root 的公共依赖装配入口。它先完成 database pool ->
+// repository -> business service 的基础装配，再按 options 附加 Producer 或
+// Consumer 等可选能力。任一选项失败时会关闭已创建资源。
+func New(ctx context.Context, cfg config.Config, options ...Option) (*App, error) {
 	application, err := newApp(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
-	if !cfg.Kafka.Enabled {
-		return application, nil
-	}
-	if !containsTopic(cfg.Kafka.Topics, biz.UserCreateTopic) {
-		application.Close()
-		return nil, fmt.Errorf("kafka topics must include %q for HTTP user creation", biz.UserCreateTopic)
-	}
-
-	producer, err := kafkadata.NewProducer(cfg.Kafka, log)
-	if err != nil {
-		application.Close()
-		return nil, err
-	}
-	application.kafkaProducer = producer
-	// user-events 是内部业务 Topic，由固定 Handler 按稳定消息 schema 发布。
-	// 将它从通用事件 API 白名单移除，可以防止任意 JSON 阻塞 Consumer。
-	application.Services.EventService = biz.NewEventService(producer, topicsExcept(cfg.Kafka.Topics, biz.UserCreateTopic))
-	application.Services.MessagePublisher = biz.NewMessagePublisher(producer, cfg.Kafka.Topics)
-	return application, nil
-}
-
-// NewWorker 创建 Kafka Consumer 及其真正需要的数据库依赖。
-// user-events 通过 UserService -> UserRepository 写入 PostgreSQL。
-// 尚未接入业务的 Topic 使用元数据日志 Handler；HTTP/gRPC server 不会在 Worker 进程中创建。
-func NewWorker(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error) {
-	if !cfg.Kafka.Enabled {
-		return nil, fmt.Errorf("kafka must be enabled for work process")
-	}
-	if !containsTopic(cfg.Kafka.Topics, biz.UserCreateTopic) {
-		return nil, fmt.Errorf("kafka topics must include %q for user worker", biz.UserCreateTopic)
-	}
-	p, err := db.NewPool(ctx, cfg.Database)
-	if err != nil {
-		return nil, err
-	}
-	userService := biz.NewUserService(repo.NewUserRepository(p))
-	application := &App{pool: p, Services: Services{UserService: userService}}
-
-	router := kafkadata.NewRouter()
-	for _, topic := range cfg.Kafka.Topics {
-		handler := kafkadata.NewMetadataLoggingHandler(log)
-		if topic == biz.UserCreateTopic {
-			handler = kafkadata.NewUserCreateHandler(userService, log)
+	for _, option := range options {
+		if option == nil {
+			continue
 		}
-		if err := router.Register(topic, handler); err != nil {
+		if err := option(ctx, cfg, application); err != nil {
 			application.Close()
-			return nil, fmt.Errorf("register kafka topic %q: %w", topic, err)
+			return nil, err
 		}
 	}
-	consumer, err := kafkadata.NewConsumer(cfg.Kafka, router, log)
-	if err != nil {
-		application.Close()
-		return nil, err
-	}
-	application.kafkaConsumer = consumer
 	return application, nil
 }
 
@@ -146,14 +100,6 @@ func newApp(ctx context.Context, cfg config.Config) (*App, error) {
 			UserService: biz.NewUserService(userRepo),
 		},
 	}, nil
-}
-
-// RunConsumers 阻塞运行本进程配置的 Consumer。Kafka 未启用时直接返回。
-func (a *App) RunConsumers(ctx context.Context) error {
-	if a == nil || a.kafkaConsumer == nil {
-		return nil
-	}
-	return a.kafkaConsumer.Run(ctx)
 }
 
 // Close 释放 New 创建的资源。对 nil App 或重复调用都是安全的，便于入口

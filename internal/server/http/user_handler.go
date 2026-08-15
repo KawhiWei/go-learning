@@ -1,4 +1,4 @@
-package server
+package httpserver
 
 import (
 	"bytes"
@@ -29,7 +29,7 @@ type UserHTTPHandler struct {
 }
 
 // Create 处理 POST /v1/users。
-// API 不再直接调用 UserService.CreateUser 写库，而是把创建消息发布到 user-events；数据库写入发生在独立 work Consumer。
+// API 不再直接调用 UserService.CreateUser 写库，而是把创建消息发布到 user-events；数据库写入发生在独立 Consumer 进程。
 // decoder 会拒绝未知字段和第二个 JSON 值，避免只完成部分解析的请求入队。
 func (h UserHTTPHandler) Create(ctx context.Context, c *app.RequestContext) {
 	body, err := c.Body()

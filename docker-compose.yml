@@ -97,20 +97,20 @@ services:
       timeout: 5s
       retries: 5
 
-  work:
+  consumer:
     build: .
-    container_name: nino-data-work
-    entrypoint: ["/app/work"]
+    container_name: nino-data-consumer
+    entrypoint: ["/app/consumer"]
     environment:
       NINO_CONFIG_PATH: /app/configs/app.yaml
       NINO_DATABASE_URL: postgres://postgres:postgres@db:5432/nino?sslmode=disable
       NINO_KAFKA_ENABLED: "true"
       NINO_KAFKA_BROKERS: kafka:9092
-      NINO_KAFKA_GROUP_ID: nino-data-work
+      NINO_KAFKA_GROUP_ID: nino-data-consumer
       NINO_KAFKA_TOPICS: user-events,audit-events
-      NINO_KAFKA_CLIENT_ID: nino-data-work
+      NINO_KAFKA_CLIENT_ID: nino-data-consumer
       NINO_KAFKA_RETRY_INTERVAL_SECS: "2"
-      NINO_KAFKA_WORKER_CONCURRENCY: "8"
+      NINO_KAFKA_CONSUMER_CONCURRENCY: "8"
       NINO_KAFKA_POLL_MAX_RECORDS: "100"
       NINO_KAFKA_SHUTDOWN_TIMEOUT_SECS: "30"
     depends_on:

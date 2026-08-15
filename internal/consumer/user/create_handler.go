@@ -1,4 +1,4 @@
-package kafka
+package userconsumer
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/luck/go-learning/internal/biz"
+	"github.com/luck/go-learning/internal/consumer"
 )
 
 // UserCreator 是 user-events Handler 所需的最小业务接口。
@@ -18,14 +19,14 @@ type UserCreator interface {
 	CreateUserWithID(context.Context, uuid.UUID, string, string) (*biz.User, error)
 }
 
-// NewUserCreateHandler 把 user.create.v1 事件转换成 UserService 调用。
+// NewCreateHandler 把 user.create.v1 事件转换成 UserService 调用。
 // 只有 Service 成功（包括相同 user_id 的幂等重投）才返回 nil，Consumer 才提交 offset。
 // 数据库临时故障会返回 error，并触发当前 partition 重试。
-func NewUserCreateHandler(service UserCreator, log *slog.Logger) Handler {
+func NewCreateHandler(service UserCreator, log *slog.Logger) consumer.Handler {
 	if log == nil {
 		log = slog.Default()
 	}
-	return HandlerFunc(func(ctx context.Context, message Message) error {
+	return consumer.HandlerFunc(func(ctx context.Context, message consumer.Message) error {
 		if service == nil {
 			return errors.New("user creator must not be nil")
 		}

@@ -10,11 +10,14 @@ import (
 
 var ErrEventTopicNotAllowed = errors.New("event topic is not allowed")
 
-// Event 是 API 发布到消息系统的业务 DTO。
+// Event 是发布到消息系统的业务 DTO。
 // 业务层不依赖具体 Kafka 客户端，因而单元测试和未来替换消息基础设施时都无需构造 franz-go 类型。
 type Event struct {
-	Topic   string
-	Key     []byte
+	// Topic 是 Kafka Topic 名称；发布前必须属于当前进程声明的 Topic 白名单。
+	Topic string
+	// Key 是 Kafka 分区键；同一 key 通常会落在同一 partition 以维持业务顺序。
+	Key []byte
+	// Payload 是已编码的消息正文；MessagePublisher 会将业务 DTO 编码为 JSON。
 	Payload []byte
 }
 
@@ -27,9 +30,12 @@ type EventPublisher interface {
 // PublishAccepted 是统一的异步消息发布结果。
 // ResourceID 是调用方可立即返回给客户端的业务 ID；它不表示 Consumer 已完成处理。
 type PublishAccepted struct {
-	MessageID  string `json:"message_id"`
+	// MessageID 是 Kafka 消息的唯一标识，用于追踪发布和消费过程。
+	MessageID string `json:"message_id"`
+	// ResourceID 是已接受异步处理的业务资源标识，例如待创建用户的 ID。
 	ResourceID string `json:"resource_id"`
-	Status     string `json:"status"`
+	// Status 描述接受状态，不表示 Consumer 已完成数据库写入。
+	Status string `json:"status"`
 }
 
 // MessagePublisher 是所有业务共用的消息发布器。
@@ -74,7 +80,7 @@ func (p *MessagePublisher) Publish(ctx context.Context, topic string, key []byte
 	})
 }
 
-// EventService 校验 HTTP 请求选择的 Topic，并协调可靠发布。
+// EventService 校验调用方选择的 Topic，并协调可靠发布。
 // allowedTopics 是明确白名单，避免调用方借助公共 API 向任意内部 Topic 写入消息。
 type EventService struct {
 	publisher     EventPublisher

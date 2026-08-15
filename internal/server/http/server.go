@@ -1,4 +1,4 @@
-package server
+package httpserver
 
 import (
 	"context"
@@ -12,10 +12,9 @@ import (
 	"github.com/luck/go-learning/internal/biz"
 )
 
-// UserService 是 HTTP 和 RPC transport 共同使用的用例边界。handler 不关心
-// user 如何持久化，这一职责由业务层和 repository 层隐藏在接口之后。
+// UserService 是 HTTP 查询用户所需的最小业务边界。创建用户接口通过消息
+// Publisher 异步处理，因此 HTTP transport 不依赖同步 CreateUser 方法。
 type UserService interface {
-	CreateUser(context.Context, string, string) (*biz.User, error)
 	GetUser(context.Context, uuid.UUID) (*biz.User, error)
 }
 

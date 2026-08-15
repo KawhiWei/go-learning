@@ -20,11 +20,11 @@ func TestKafkaEnvironmentOverrides(t *testing.T) {
 	t.Setenv("NINO_KAFKA_BROKERS", " kafka-1:9092,kafka-2:9092,kafka-1:9092 ")
 	t.Setenv("NINO_KAFKA_TOPICS", "users,audit")
 	t.Setenv("NINO_KAFKA_CLIENT_ID", "api-producer")
-	t.Setenv("NINO_KAFKA_WORKER_CONCURRENCY", "12")
+	t.Setenv("NINO_KAFKA_CONSUMER_CONCURRENCY", "12")
 	t.Setenv("NINO_KAFKA_POLL_MAX_RECORDS", "250")
 	cfg := Default()
 	applyEnv(&cfg)
-	if len(cfg.Kafka.Brokers) != 2 || cfg.Kafka.WorkerConcurrency != 12 || cfg.Kafka.PollMaxRecords != 250 {
+	if len(cfg.Kafka.Brokers) != 2 || cfg.Kafka.ConsumerConcurrency != 12 || cfg.Kafka.PollMaxRecords != 250 {
 		t.Fatalf("Kafka env overrides = %#v", cfg.Kafka)
 	}
 	if cfg.Kafka.ClientID != "api-producer" {

@@ -1,4 +1,4 @@
-package kafka
+package consumer
 
 import (
 	"context"
@@ -34,13 +34,5 @@ func TestRouterRejectsDuplicateAndUnknownTopic(t *testing.T) {
 	}
 	if err := router.Handle(context.Background(), Message{Topic: "audit"}); !errors.Is(err, ErrHandlerNotFound) {
 		t.Fatalf("unknown topic error = %v", err)
-	}
-}
-
-func TestWaitForRetryCanBeCancelled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := waitForRetry(ctx, 1); !errors.Is(err, context.Canceled) {
-		t.Fatalf("waitForRetry error = %v", err)
 	}
 }

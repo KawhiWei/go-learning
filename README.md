@@ -1,8 +1,21 @@
 # nino-data-postgres
 
-一个使用 PostgreSQL 持久化用户数据的 Go 服务示例。HTTP API 基于 CloudWeGo Hertz，gRPC API 基于 CloudWeGo Kitex 的标准 HTTP/2 transport；两个服务共享同一个业务层和仓储实现。
+一个使用 PostgreSQL 持久化数据、Kafka 解耦异步写入的 Go 服务。HTTP API
+使用 CloudWeGo Hertz，gRPC API 使用 CloudWeGo Kitex，独立 Consumer 使用
+franz-go 消费 Kafka；三个进程共享业务层和 Repository 契约。
 
-## 这是标准 Go 项目结构吗
+## 运行单元
+
+| 进程 | 入口 | 职责 | 不负责 |
+|---|---|---|---|
+| HTTP API | `cmd/api-server/main.go` | Hertz 路由、Swagger、查询用户、向 Kafka 发布创建用户消息 | 消费 Kafka、直接执行用户创建 SQL |
+| gRPC | `cmd/grpc-server/main.go` | Kitex 注册 Proto Service，实现同步创建和查询用户 RPC | HTTP 路由、Kafka 消费 |
+| Consumer | `cmd/consumer/main.go` | 消费多个 Topic、按业务 Handler 分发、写 PostgreSQL、提交 offset | 对外提供 HTTP/gRPC 接口 |
+
+本地 Compose 还会启动 PostgreSQL 12.18、Kafka、Kafka UI、数据库迁移和
+Topic 初始化任务。
+
+## 项目结构原则
 
 Go 官方没有规定 Web 服务必须采用某一种目录结构。本项目使用的是生产项目中常见的组合方式：
 
@@ -10,7 +23,9 @@ Go 官方没有规定 Web 服务必须采用某一种目录结构。本项目使
 - Handler -> Service -> Repository 是应用分层方式，不是 Go 语言规范，但适合接口较多、需要同时支持 HTTP 和 gRPC 的服务。
 - `api`、`configs`、`migrations`、`scripts` 和 `pkg` 是常见的工程目录，是否保留应由项目规模决定。
 
-因此，这是一套合理且可扩展的 Go 服务结构，但不是唯一的“官方标准”。对于只有几个接口的小程序可以适当合并目录；当业务模块增多时，当前结构可以避免所有初始化、路由和数据库代码堆积在 `main.go` 中。
+因此，这是一套合理且可扩展的 Go 服务结构，但不是唯一的“官方标准”。
+它的核心约束是：入口只启动进程，传输层只转换协议，业务层不依赖框架，
+数据层只实现基础设施，`app` 只装配依赖。
 
 ## 目录结构与分层职责
 
@@ -23,34 +38,62 @@ Go 官方没有规定 Web 服务必须采用某一种目录结构。本项目使
 ├── cmd/                         # 可执行程序入口，一个服务一个子目录
 │   ├── api-server/              # Hertz HTTP 服务入口
 │   │   └── main.go
-│   ├── work/                    # Kafka Consumer Worker 独立进程入口
+│   ├── consumer/                # Kafka Consumer 独立进程入口
 │   │   └── main.go
 │   └── grpc-server/             # Kitex gRPC 服务入口
 │       └── main.go
 ├── internal/                    # 本项目私有实现，仓库外部不能直接导入
-│   ├── app/                     # Composition Root，统一组装全部依赖
+│   ├── app/                     # Composition Root，按文件组装各进程依赖
+│   │   ├── app.go               # 基础依赖、Services、App 生命周期和 Option 机制
+│   │   ├── kafka_producer.go    # 可供任意进程启用的 Producer 能力
+│   │   └── kafka_consumer.go     # 可供任意进程启用的 Kafka Consumer 能力
 │   ├── biz/                     # 业务实体、业务规则、Service 和仓储接口
 │   ├── config/                  # 配置结构、文件读取和环境变量覆盖
 │   ├── data/                    # 基础设施和数据访问实现
 │   │   ├── db/                  # PostgreSQL 连接池及数据库相关代码
 │   │   │   ├── model/           # 与数据库记录对应的持久化模型
 │   │   │   └── repo/            # Repository 实现、SQL 和模型转换
-│   │   └── kafka/               # Kafka Producer、Consumer 和 Topic 路由
-│   │       ├── producer.go      # API 事件发布及 broker ack 等待
-│   │       ├── consumer.go      # Worker Consumer Group、轮询、并发和 offset 提交
-│   │       ├── router.go        # 按 Topic 分发到对应 Handler
-│   │       └── logging_handler.go # 当前用于验证链路的元数据占位 Handler
-│   └── server/                  # HTTP/gRPC 协议适配、路由和 Handler
+│   │   └── kafka/               # Kafka Producer 和 Consumer 基础设施
+│   │       ├── producer.go      # 通用事件发布及 broker ack 等待
+│   │       └── consumer.go      # Consumer Group、轮询、并发和 offset 提交
+│   ├── consumer/                  # Kafka 消息抽象、Topic 路由和业务 Handler
+│   │   ├── message.go           # 与 Kafka 客户端无关的 Message/Handler 契约
+│   │   ├── router.go            # 公共 TopicRouter 及按 Topic 分发
+│   │   ├── user/                # User 业务独立目录
+│   │   │   └── create_handler.go
+│   │   └── audit/               # Audit 业务独立目录
+│   │       └── logging_handler.go
+│   └── server/                  # 对外传输协议适配层
+│       ├── http/                # Hertz Server、HTTP 路由、Handler 和响应映射
+│       └── grpc/                # Kitex Proto Service 实现和 gRPC 错误映射
 ├── pkg/                         # 确实允许其他项目导入的通用包
 │   └── logger/                  # 与业务无关的日志封装
 ├── configs/                     # 可部署的默认配置文件
 ├── migrations/                  # 按顺序执行的数据库结构迁移
 ├── scripts/                     # 代码生成、迁移等开发和运维脚本
-├── Dockerfile                   # 构建 HTTP、gRPC 和 Worker 镜像
-├── docker-compose.yml           # 本地编排 PostgreSQL、Kafka、API、Worker 和 gRPC
+├── Dockerfile                   # 构建 HTTP、gRPC 和 Consumer 镜像
+├── docker-compose.yml           # 本地编排 PostgreSQL、Kafka、API、Consumer 和 gRPC
 ├── go.mod                       # Go module 名称及直接依赖声明
 └── go.sum                       # 依赖版本校验信息
 ```
+
+## 分层职责速查
+
+| 层/目录 | 主要职责 | 不应该放入 |
+|---|---|---|
+| `api` | Proto、OpenAPI 和生成代码等对外协议契约 | Service 实现、SQL、Kafka 消费逻辑 |
+| `cmd` | 加载配置、调用 `internal/app`、启动和停止进程 | Repository 创建细节、业务规则、请求处理 |
+| `internal/app` | Composition Root：创建依赖、连接实现、统一关闭资源 | SQL、Kafka poll、JSON/Proto 解析、业务判断 |
+| `internal/biz` | 业务实体、Service、业务错误、Repository 接口、消息 DTO | Hertz、Kitex、franz-go、PostgreSQL 驱动类型 |
+| `internal/data/db` | 连接池、DB Model、Repository 实现和 SQL | HTTP 状态码、用户输入协议、业务流程编排 |
+| `internal/data/kafka` | Kafka Producer/Consumer、重连、poll、并发和 offset | `user.create.v1` 等具体业务处理逻辑 |
+| `internal/consumer` | 客户端无关的 Message/Handler/Router，以及按业务拆分的 Consumer Handler | franz-go Record、数据库连接创建 |
+| `internal/server/http` | Hertz Server、路由、HTTP Handler、JSON 和错误映射 | SQL、Repository 实现、Kafka 客户端初始化 |
+| `internal/server/grpc` | Kitex Proto Service 实现和 gRPC 错误映射 | HTTP DTO、SQL、Kitex Server 生命周期装配 |
+| `pkg` | 确实允许仓库外项目复用的通用工具 | 当前项目专属业务代码 |
+
+依赖方向保持为：传输/Consumer Handler -> `biz.Service` -> Repository 接口；
+`data` 提供 Repository 和消息客户端实现，`app` 在启动时把它们连接起来。
 
 ### `api`：对外协议层
 
@@ -64,10 +107,10 @@ Go 官方没有规定 Web 服务必须采用某一种目录结构。本项目使
 
 - 加载配置和初始化日志；
 - 创建应用依赖；
-- 启动 Hertz、Kitex 或 Kafka Worker；
+- 启动 Hertz、Kitex 或 Kafka Consumer；
 - HTTP 入口调用 `h.Spin()`，由 Hertz 监听退出信号并执行优雅关闭。
 - gRPC 入口调用 `rpcServer.Run()`，由 Kitex 监听退出信号并执行优雅 `Stop()`。
-- Worker 入口调用 Consumer 的运行循环，监听 `SIGINT`/`SIGTERM` 后停止拉取、排空在途任务并关闭 Consumer。
+- Consumer 入口调用 Consumer 的运行循环，监听 `SIGINT`/`SIGTERM` 后停止拉取、排空在途任务并关闭 Consumer。
 
 `main.go` 调用 `internal/app.New` 创建完整应用是正常的启动流程，但不应该自己执行 SQL、创建 Repository 或处理业务请求。运行期间的请求仍然由路由进入 Handler。
 
@@ -75,13 +118,30 @@ Go 官方没有规定 Web 服务必须采用某一种目录结构。本项目使
 
 `cmd/grpc-server` 同样把 RPC 生命周期交给 Kitex：入口直接调用阻塞式 `rpcServer.Run()`，不再另外创建 signal channel、goroutine 或手动调用 `rpcServer.Stop()`。Kitex 完成优雅关闭并返回后，`defer application.Close()` 再释放 PostgreSQL 连接池。
 
-`cmd/work/main.go` 是独立的 Kafka Consumer 进程，由自身生命周期管理，不由 HTTP API 进程启动。它调用 `internal/app.NewWorker` 创建数据库连接池、User Repository/Service、Consumer Group 和 Topic Router。它把 `user-events` 交给真实的用户创建 Handler，把尚未接入业务的 `audit-events` 交给元数据占位 Handler；收到 `SIGTERM` 后停止拉取，等待在途任务和 offset 处理完成再退出。API 只发布消息，不加入 Consumer Group。
+`cmd/consumer/main.go` 是独立的 Kafka Consumer 进程，由自身生命周期管理，不由 HTTP API 进程启动。它以 `app.New(..., app.WithKafkaConsumer(...))` 创建数据库连接池、User Repository/Service、Consumer Group 和 Topic Router。公共消息契约与路由位于 `internal/consumer`，`user-events` 使用 `internal/consumer/user` 的用户创建 Handler，尚未接入业务的 `audit-events` 使用 `internal/consumer/audit` 的元数据占位 Handler；收到 `SIGTERM` 后停止拉取，等待在途任务和 offset 处理完成再退出。当前 API 只启用 Producer，不加入 Consumer Group。
 
 ### `internal/app`：依赖组装层
 
-这是应用的 Composition Root。API 进程按 PostgreSQL Pool -> Repository -> Service，再创建 Kafka Producer -> EventService/MessagePublisher 的顺序装配；Worker 装配自己的 PostgreSQL Pool -> UserRepository -> UserService -> user-events Handler，以及 Kafka Consumer/Router，但不创建 HTTP 或 gRPC server。每个进程只关闭自己创建的连接池和 Kafka 客户端。
+这是应用的 Composition Root。`app.New` 固定装配 PostgreSQL Pool -> Repository -> Service；随后入口通过 Option 按进程职责追加基础设施能力：`WithKafkaProducer` 创建通用 Producer、`EventService` 和 `MessagePublisher`，`WithKafkaConsumer` 创建 Topic Router、业务 Handler 和 Consumer Group，`RequireKafkaTopics` 在启动期校验业务模块所需 Topic 已配置。app 只负责依赖组装和生命周期，不实现 Kafka 轮询、消息解析或业务规则；每个进程只关闭自己创建的连接池和 Kafka 客户端。
 
-依赖组装只在程序启动时执行一次，不属于某个 HTTP/gRPC 请求的调用链。以后增加 `OrderService` 时，应在这里增加对应 Repository 和 Service 的组装，而不是继续向 `main.go` 填充初始化细节。
+Producer 不是 HTTP API 专属能力。HTTP、gRPC 和 Consumer 进程都可以使用同一个 `WithKafkaProducer`，一个 Consumer 进程也可以同时启用 Producer 和 Consumer。例如未来 gRPC 发布订单事件时，只需在它的 composition root 中加入 `app.WithKafkaProducer(log)`，不需要新增 `NewGRPCProducer` 或复制 Kafka 初始化代码：
+
+```go
+// HTTP：发布用户创建消息。
+httpApp, err := app.New(ctx, cfg,
+    app.WithKafkaProducer(log),
+    app.RequireKafkaTopics(biz.UserCreateTopic),
+)
+
+// Consumer：消费消息；未来若需要处理后再发布，也可以同时附加 Producer。
+consumerApp, err := app.New(ctx, cfg,
+    app.WithKafkaProducer(log), // 当前不需要时可以删除这一行。
+    app.RequireKafkaTopics(biz.UserCreateTopic),
+    app.WithKafkaConsumer(log),
+)
+```
+
+`RequireKafkaTopics` 与 Producer/Consumer 分离，是为了让业务模块显式声明自己依赖的 Topic；它不创建客户端，因此也可用于一个只消费而不发布的进程。依赖组装只在程序启动时执行一次，不属于某个 HTTP/gRPC 请求的调用链。以后增加 `OrderService` 时，应在这里增加对应 Repository 和 Service 的组装，在对应入口选择需要的 Option，而不是继续向 `main.go` 填充初始化细节。
 
 ### `internal/biz`：业务层
 
@@ -113,7 +173,7 @@ err := publisher.Publish(ctx, "order-events", []byte(message.OrderID), message)
 
 `data/db` 创建和配置 PostgreSQL 连接池；`data/db/model` 定义与数据库记录对应的持久化模型；`data/db/repo` 实现业务层声明的 Repository 接口，负责 SQL、唯一键冲突以及 DB Model 与业务实体之间的转换。DB Model 不应直接传给 Handler，数据库字段变化也不应直接改变 HTTP DTO。
 
-这一层只处理数据存取，不负责邮箱是否合法、用户是否允许创建等业务规则。Kafka 的基础设施实现位于 `internal/data/kafka`：`producer.go` 封装事件发布，`consumer.go` 封装 Worker 的 Consumer Group、轮询、并发、重试和 offset 提交，`router.go` 保存 Topic 到 Handler 的注册表并负责分发。
+这一层只处理数据存取，不负责邮箱是否合法、用户是否允许创建等业务规则。Kafka 的基础设施实现位于 `internal/data/kafka`：`producer.go` 封装事件发布，`consumer.go` 封装 Consumer Group、轮询、并发、重试和 offset 提交。消息 DTO、Handler 契约和 Topic 路由位于 `internal/consumer`，不与 Kafka 客户端实现绑定；每个业务的 Handler 再放入独立的 `internal/consumer/<business>` 子包。
 
 ### Kafka 事件发布与消费
 
@@ -128,14 +188,29 @@ POST /v1/users
     -> Kafka broker ack
     -> HTTP 202 Accepted
 
-nino-data-work
+nino-data-consumer
     -> user-events / user.create.v1
-    -> UserCreateHandler
+    -> internal/consumer/user.NewCreateHandler
     -> UserService.CreateUserWithID
     -> UserRepository
     -> PostgreSQL
     -> Handler 成功后提交 offset
 ```
+
+当前 gRPC 创建用户保持同步链路，和 HTTP 异步写入链路相互独立：
+
+```text
+CreateUser Proto 请求
+    -> Kitex 生成的 Service dispatcher
+    -> internal/server/grpc.KitexUserServer
+    -> biz.UserService.CreateUser
+    -> biz.UserRepository
+    -> internal/data/db/repo.UserRepository
+    -> PostgreSQL
+    -> CreateUser Proto 响应
+```
+
+当 gRPC 将来也需要发布 Kafka 消息时，调用链只是在对应 Kitex Handler 中进入 `MessagePublisher.Publish`；基础设施仍由 `app.WithKafkaProducer` 注入，不会改变 gRPC Handler -> Service/Publisher 的分层边界。
 
 `202` 只表示 Kafka 已确认消息，数据库可能还没有完成写入。响应中的 `resource_id` 可用于随后调用 `GET /v1/users/:id`；短时间返回 `404` 属于最终一致性窗口，客户端应采用有上限的退避重试。相同事件重投会携带相同 `user_id`：数据库中 ID 与内容完全一致时视为幂等成功；同 ID 不同内容或 email 已被其他 ID 使用仍是冲突，不会被静默忽略。gRPC 的 CreateUser 暂时仍保持原同步写库语义。
 
@@ -151,53 +226,57 @@ POST /v1/events/:topic
     -> HTTP 202 Accepted
 ```
 
-`EventService` 从配置的 `kafka.topics` 生成 Topic 白名单，并排除系统消息 Topic。请求的 `:topic` 不在白名单时直接返回参数错误，不会向任意内部 Topic 发布。Producer 等待 broker 确认后，Handler 才返回 `202 Accepted`；这个状态只表示消息已交给 Kafka，不表示 Worker 已经取到消息、Handler 已完成或数据库事务已经提交。Producer 超时或 broker 不可用时返回发布失败，API 不伪造成功响应。
+`EventService` 从配置的 `kafka.topics` 生成 Topic 白名单，并排除系统消息 Topic。请求的 `:topic` 不在白名单时直接返回参数错误，不会向任意内部 Topic 发布。Producer 等待 broker 确认后，Handler 才返回 `202 Accepted`；这个状态只表示消息已交给 Kafka，不表示 Consumer 已经取到消息、Handler 已完成或数据库事务已经提交。Producer 超时或 broker 不可用时返回发布失败，API 不伪造成功响应。
 
 `user-events` 是内部系统消息 Topic，已从通用 `/v1/events/:topic` 白名单排除，避免任意 JSON 绕过用户校验并形成毒消息。创建用户必须调用 `/v1/users`；通用事件接口目前可用于 `audit-events` 等非系统命令 Topic。
 
-Worker 由 `cmd/work/main.go` 独立运行：一个 Consumer Group（`group_id`）同时订阅 `topics` 中的全部 Topic，Kafka 负责把各 Topic 的 partition 分配给该 Group 的 Worker 实例。Router 按 Topic 找到业务 Handler，消息 DTO 不把 franz-go 类型泄露给业务层。
+Consumer 由 `cmd/consumer/main.go` 独立运行：一个 Consumer Group（`group_id`）同时订阅 `topics` 中的全部 Topic，Kafka 负责把各 Topic 的 partition 分配给该 Group 的 Consumer 实例。`internal/consumer` 的公共 Router 按 Topic 找到对应业务子包中的 Handler，消息 DTO 不把 franz-go 类型泄露给业务层。
 
-Worker 的处理模型如下：
+Consumer 的处理模型如下：
 
 ```text
 PollRecords（最多 poll_max_records 条）
-    -> 有界并发池（worker_concurrency）
+    -> 有界并发池（consumer_concurrency）
     -> 同一 Topic/partition 按 offset 顺序执行 Handler
     -> 只提交每个 partition 已连续成功的 offset（可批量提交）
     -> 继续拉取下一批消息
 ```
 
-并发上限跨所有 Topic/partition 共享；不同 partition 可以并行，同一 partition 始终保序。Handler 返回错误时按 `retry_interval_seconds` 重试且不推进该 partition 的提交点；提交失败也按同一间隔重试，但已成功的 Handler 不因提交重试再次执行。应用退出或 rebalance 时停止接收新任务，等待在途任务结束，提交已经连续完成的 offset，再安全释放 partition；无法在 `shutdown_timeout_seconds` 内完成的任务会随进程退出而由 Kafka 重新投递。franz-go 负责 broker 连接维护和断线重连，Worker 对轮询、Handler、提交错误做日志记录和重试。
+并发上限跨所有 Topic/partition 共享；不同 partition 可以并行，同一 partition 始终保序。Handler 返回错误时按 `retry_interval_seconds` 重试且不推进该 partition 的提交点；提交失败也按同一间隔重试，但已成功的 Handler 不因提交重试再次执行。应用退出或 rebalance 时停止接收新任务，等待在途任务结束，提交已经连续完成的 offset，再安全释放 partition；无法在 `shutdown_timeout_seconds` 内完成的任务会随进程退出而由 Kafka 重新投递。franz-go 负责 broker 连接维护和断线重连，Consumer 对轮询、Handler、提交错误做日志记录和重试。
 
-`user-events` 已注册 `UserCreateHandler` 并写 PostgreSQL；`audit-events` 当前仍使用 `NewMetadataLoggingHandler` 占位，只记录 Topic、partition、offset 和 key/value 字节数，不输出消息正文。Handler 成功但 offset 尚未提交时仍可能重投，所以所有真实 Handler 都必须幂等。当前失败消息会无限重试：毒消息会阻塞自己的 partition，并让本次 poll 批次等待收尾；其他 partition 的 Handler 可以并发完成，但 offset 也要等批次进入提交阶段。生产环境还应增加重试上限、DLQ、告警和 lag 监控；当前实现尚未提供 DLQ。
+`user-events` 已注册 `internal/consumer/user.NewCreateHandler` 并写 PostgreSQL；`audit-events` 当前仍使用 `internal/consumer/audit.NewMetadataLoggingHandler` 占位，只记录 Topic、partition、offset 和 key/value 字节数，不输出消息正文。Handler 成功但 offset 尚未提交时仍可能重投，所以所有真实 Handler 都必须幂等。当前失败消息会无限重试：毒消息会阻塞自己的 partition，并让本次 poll 批次等待收尾；其他 partition 的 Handler 可以并发完成，但 offset 也要等批次进入提交阶段。生产环境还应增加重试上限、DLQ、告警和 lag 监控；当前实现尚未提供 DLQ。
 
 ### Goroutine 与并发池调优
 
-Consumer 的并发单位是 `Topic + Partition`，不是单条消息。同一 partition 的消息由同一个 goroutine 按 offset 顺序处理，避免后面的 offset 先提交导致中间消息丢失。每次 poll 实际创建的 worker 数为：
+Consumer 的并发单位是 `Topic + Partition`，不是单条消息。同一 partition 的消息由同一个 goroutine 按 offset 顺序处理，避免后面的 offset 先提交导致中间消息丢失。每次 poll 实际创建的 consumer 数为：
 
 ```text
-min(worker_concurrency, 当前批次包含的 partition 数)
+min(consumer_concurrency, 当前批次包含的 partition 数)
 ```
 
 调优时遵循这些约束：
 
-- `worker_concurrency` 高于订阅 Topic 的可用 partition 总数不会提升吞吐；要继续扩容，先增加 partition，再增加 Worker 实例或并发数。
-- 用户 Handler 会访问 PostgreSQL，单个 Worker 的 `worker_concurrency` 通常不应高于 `database.max_conns`，还要为重试、健康检查以及同进程的其他任务预留连接。Compose 当前二者分别为 `8` 和 `10`。
+- `consumer_concurrency` 高于订阅 Topic 的可用 partition 总数不会提升吞吐；要继续扩容，先增加 partition，再增加 Consumer 实例或并发数。
+- 用户 Handler 会访问 PostgreSQL，单个 Consumer 的 `consumer_concurrency` 通常不应高于 `database.max_conns`，还要为重试、健康检查以及同进程的其他任务预留连接。Compose 当前二者分别为 `8` 和 `10`。
 - `poll_max_records` 越大，单批吞吐可能越高，但内存占用、批次尾延迟、rebalance 等待时间以及毒消息影响范围也越大；应结合单条消息大小和 P99 Handler 时延逐步调整。
 - 扩容前监控 consumer lag、单条/单批处理时延、DB pool acquire wait、活跃连接数、CPU、内存、重试次数和 DLQ 数量。只有 CPU/DB 仍有余量且 lag 持续增长时，增加并发才有意义。
-- 每批 worker goroutine 在 `WaitGroup` 完成后退出，不会跨 poll 无限累积；`shutdown_timeout_seconds` 必须大于正常批次 P99 处理时间，并小于容器 `stop_grace_period`。
+- 每批 consumer goroutine 在 `WaitGroup` 完成后退出，不会跨 poll 无限累积；`shutdown_timeout_seconds` 必须大于正常批次 P99 处理时间，并小于容器 `stop_grace_period`。
 
 如果一次业务操作同时要求“数据库写入 + Kafka 发布”原子可靠，应该采用 Transactional Outbox：在同一个数据库事务中写业务数据和 outbox 记录，再由独立 relay 发布并记录发送状态。本接口是独立事件发布接口，不提供数据库与 Kafka 的双写事务，也不应宣称具备该原子性。
 
 ### `internal/server`：传输与接口适配层
 
-这一层负责把 HTTP 或 gRPC 请求转换为 Service 参数，再把 Service 返回值和错误转换为 JSON、Protobuf、HTTP 状态码或 gRPC 状态码，主要包括：
+这一层负责把 HTTP 或 gRPC 请求转换为 Service 参数，再把 Service 返回值和错误转换为 JSON、Protobuf、HTTP 状态码或 gRPC 状态码。不同协议拆成独立 Go package，避免 Hertz 与 Kitex 的类型、路由和错误处理混在同一目录：
 
-- `http_routes.go`：公共路由和各业务模块的总注册入口；
-- `http_user_routes.go`：User 模块的 URL 与 Handler 绑定；
-- `http_user_handler.go`：解析参数并调用 `UserService`；
-- `http_response.go`：统一 HTTP 响应和错误映射；
-- `grpc.go`：Kitex Handler 和 gRPC 错误映射。
+- `internal/server/http/server.go`：创建 Hertz Server，并注册 404/405 fallback；
+- `internal/server/http/routes.go`：公共路由和各 HTTP 业务模块的总注册入口；
+- `internal/server/http/user_routes.go`：User 模块的 URL 与 Handler 绑定；
+- `internal/server/http/user_handler.go`：解析 JSON、Path 参数并调用业务边界；
+- `internal/server/http/response.go`：统一 HTTP JSON 响应和错误映射；
+- `internal/server/grpc/user_handler.go`：实现 Proto 生成的 `gen.UserService` 接口；
+- `internal/server/grpc/error.go`：把业务错误映射为 gRPC status code。
+
+两个 package 分别声明自己真正需要的最小 `UserService` 接口。Go 的隐式接口让同一个 `*biz.UserService` 可以同时注入 HTTP 和 gRPC，不需要让 gRPC 依赖 HTTP package，也不需要在业务层引入 Hertz 或 Kitex 类型。
 
 Handler 不直接访问数据库。新增接口时，应把路由注册和 Handler 放在这一层，把实际业务规则放在 `internal/biz`。
 
@@ -286,9 +365,9 @@ createdb nino
 DATABASE_URL='postgres://postgres:postgres@localhost:5432/nino?sslmode=disable' ./scripts/migrate.sh
 go run ./cmd/api-server
 go run ./cmd/grpc-server
-# 启用 Kafka 后另起一个终端运行独立 Worker（brokers/topics 按本地环境调整）。
+# 启用 Kafka 后另起一个终端运行独立 Consumer（brokers/topics 按本地环境调整）。
 NINO_KAFKA_ENABLED=true NINO_KAFKA_BROKERS=localhost:9092 \
-NINO_KAFKA_TOPICS=user-events,audit-events go run ./cmd/work
+NINO_KAFKA_TOPICS=user-events,audit-events go run ./cmd/consumer
 ```
 
 默认 HTTP 监听 `:8080`，gRPC 监听 `:9090`。配置文件为 `configs/app.yaml`，也可以使用 `NINO_HTTP_ADDR`、`NINO_GRPC_ADDR`、`NINO_DATABASE_URL`、`NINO_DB_MAX_CONNS`、`NINO_DB_MIN_CONNS` 和 `NINO_LOG_LEVEL` 覆盖配置。配置文件路径可由 `NINO_CONFIG_PATH` 指定。
@@ -301,36 +380,36 @@ Kafka 配置位于 `configs/app.yaml` 的 `kafka` 节点。下面是完整结构
 kafka:
   enabled: false
   brokers: []
-  group_id: "nino-data-work"
+  group_id: "nino-data-consumer"
   topics: []
   client_id: "nino-data"
   retry_interval_seconds: 5
   publish_timeout_seconds: 10
-  worker_concurrency: 8
+  consumer_concurrency: 8
   poll_max_records: 100
   shutdown_timeout_seconds: 30
 ```
 
-启用 Kafka 时，`brokers`、`group_id`、`topics`、`client_id` 必须非空；所有时间和并发/批次参数都必须为正数。`brokers` 与 `topics` 是列表，环境变量形式使用逗号分隔。API 使用 `enabled`、`brokers`、`topics`、`client_id` 和 `publish_timeout_seconds` 创建 Producer；Worker 还使用 `group_id`、`retry_interval_seconds`、`worker_concurrency`、`poll_max_records` 和 `shutdown_timeout_seconds`。配置文件值可以用以下环境变量覆盖：
+启用 Kafka 时，`brokers`、`group_id`、`topics`、`client_id` 必须非空；所有时间和并发/批次参数都必须为正数。`brokers` 与 `topics` 是列表，环境变量形式使用逗号分隔。任何启用 `WithKafkaProducer` 的进程使用 `enabled`、`brokers`、`topics`、`client_id` 和 `publish_timeout_seconds` 创建 Producer；启用 `WithKafkaConsumer` 的进程还使用 `group_id`、`retry_interval_seconds`、`consumer_concurrency`、`poll_max_records` 和 `shutdown_timeout_seconds`。配置文件值可以用以下环境变量覆盖：
 
 | 环境变量 | 含义与示例 |
 |---|---|
-| `NINO_KAFKA_ENABLED` | 是否启用 Kafka Producer/Worker；`true` 或 `false` |
+| `NINO_KAFKA_ENABLED` | 是否启用 Kafka Producer/Consumer；`true` 或 `false` |
 | `NINO_KAFKA_BROKERS` | Broker 地址列表，逗号分隔，例如 `kafka:9092,kafka-2:9092` |
-| `NINO_KAFKA_GROUP_ID` | Worker Consumer Group 名称，例如 `nino-data-work` |
-| `NINO_KAFKA_TOPICS` | Producer 白名单及 Worker 订阅 Topic，逗号分隔，例如 `user-events,audit-events` |
-| `NINO_KAFKA_CLIENT_ID` | franz-go 客户端标识，例如 `nino-data-api` 或 `nino-data-work` |
-| `NINO_KAFKA_RETRY_INTERVAL_SECS` | Worker Handler/offset 提交失败后的重试间隔（秒），例如 `2` |
+| `NINO_KAFKA_GROUP_ID` | Consumer Group 名称，例如 `nino-data-consumer` |
+| `NINO_KAFKA_TOPICS` | Producer 白名单及 Consumer 订阅 Topic，逗号分隔，例如 `user-events,audit-events` |
+| `NINO_KAFKA_CLIENT_ID` | franz-go 客户端标识，例如 `nino-data-api` 或 `nino-data-consumer` |
+| `NINO_KAFKA_RETRY_INTERVAL_SECS` | Consumer Handler/offset 提交失败后的重试间隔（秒），例如 `2` |
 | `NINO_KAFKA_PUBLISH_TIMEOUT_SECS` | API 等待 broker ack 的超时时间（秒），例如 `10` |
-| `NINO_KAFKA_WORKER_CONCURRENCY` | Worker 跨 partition 的有界并发任务数，例如 `8` |
-| `NINO_KAFKA_POLL_MAX_RECORDS` | Worker 每次轮询最多接收的消息数，例如 `100` |
-| `NINO_KAFKA_SHUTDOWN_TIMEOUT_SECS` | Worker 收到 SIGTERM 后等待在途任务/提交完成的最长时间，例如 `30` |
+| `NINO_KAFKA_CONSUMER_CONCURRENCY` | Consumer 跨 partition 的有界并发任务数，例如 `8` |
+| `NINO_KAFKA_POLL_MAX_RECORDS` | Consumer 每次轮询最多接收的消息数，例如 `100` |
+| `NINO_KAFKA_SHUTDOWN_TIMEOUT_SECS` | Consumer 收到 SIGTERM 后等待在途任务/提交完成的最长时间，例如 `30` |
 
-在本地 Compose 中，`api` 和 `work` 容器通过 `kafka:9092` 连接 Kafka；宿主机执行 Kafka CLI 时也通过 `docker compose exec kafka` 进入 Kafka 容器，不要把容器内地址改成 `localhost:9092`。`NINO_CONFIG_PATH` 仍可指定 YAML 路径。
+在本地 Compose 中，`api` 和 `consumer` 容器通过 `kafka:9092` 连接 Kafka；宿主机执行 Kafka CLI 时也通过 `docker compose exec kafka` 进入 Kafka 容器，不要把容器内地址改成 `localhost:9092`。`NINO_CONFIG_PATH` 仍可指定 YAML 路径。
 
 ## Docker Compose
 
-Compose 会启动 PostgreSQL、单节点 Kafka 和 Kafbat Kafka UI，运行一次数据库迁移，创建 `user-events`、`audit-events` 两个 Topic，再启动 API、独立 Worker 和 gRPC 服务。后台启动：
+Compose 会启动 PostgreSQL、单节点 Kafka 和 Kafbat Kafka UI，运行一次数据库迁移，创建 `user-events`、`audit-events` 两个 Topic，再启动 API、独立 Consumer 和 gRPC 服务。后台启动：
 
 PostgreSQL 容器的 `5432` 映射到宿主机 `51432`；宿主机数据库客户端使用 `localhost:51432`，Compose 内部服务仍使用 `db:5432`。
 
@@ -371,26 +450,26 @@ printf '%s\n' '{"event":"login","actor":"demo-user"}' | \
   --bootstrap-server kafka:9092 --topic audit-events
 ```
 
-查看独立 Worker 日志：
+查看独立 Consumer 日志：
 
 ```sh
-docker compose logs -f work
+docker compose logs -f consumer
 ```
 
-`audit-events` 日志中的 `topic`、`partition`、`offset`、`key_size` 和 `value_size` 是占位 Handler 记录的元数据，不包含正文；`user-events` 成功日志会包含事件和用户 ID。查看 Worker Consumer Group `nino-data-work` 的 partition offset、lag 等信息：
+`audit-events` 日志中的 `topic`、`partition`、`offset`、`key_size` 和 `value_size` 是占位 Handler 记录的元数据，不包含正文；`user-events` 成功日志会包含事件和用户 ID。查看 Consumer Group `nino-data-consumer` 的 partition offset、lag 等信息：
 
 ```sh
 docker compose exec kafka \
   /opt/kafka/bin/kafka-consumer-groups.sh \
   --bootstrap-server kafka:9092 \
-  --describe --group nino-data-work
+  --describe --group nino-data-consumer
 ```
 
-`work` 服务的 `container_name` 是 `nino-data-work`，并配置了 `restart: unless-stopped` 与约 35 秒的停止宽限期。Worker 进程重启后会以同一个 Group 继续消费 Kafka 中尚未提交的 offset；已提交 offset 不会回退，未提交消息可能至少一次投递。查看所有服务日志、单独重启 Worker 或停止并删除本次 Compose 容器（命名卷仍保留）：
+`consumer` 服务的 `container_name` 是 `nino-data-consumer`，并配置了 `restart: unless-stopped` 与约 35 秒的停止宽限期。Consumer 进程重启后会以同一个 Group 继续消费 Kafka 中尚未提交的 offset；已提交 offset 不会回退，未提交消息可能至少一次投递。查看所有服务日志、单独重启 Consumer 或停止并删除本次 Compose 容器（命名卷仍保留）：
 
 ```sh
 docker compose logs -f
-docker compose restart work
+docker compose restart consumer
 docker compose down
 ```
 
@@ -401,7 +480,7 @@ Swagger API 文档：
 
 ## 新增业务模块
 
-新增业务模块时，先在 `internal/biz` 定义服务和仓储边界，再在 `internal/data/db` 实现仓储；随后把具体服务加入 `internal/app.Services` 并在 `app.New` 中完成 wiring，最后在 `internal/server` 为 HTTP 注册模块路由、为 Kitex 注册对应服务。总路由只负责模块编排，模块路由和 handler 负责本模块的协议转换。
+新增业务模块时，先在 `internal/biz` 定义服务和仓储边界，再在 `internal/data/db` 实现仓储；随后把具体服务加入 `internal/app.Services` 并在 `app.go`/对应进程装配文件中完成 wiring。Kafka 公共 `Message`、`Handler` 和 `TopicRouter` 放在 `internal/consumer`，每个业务的消息 schema 和 Handler 放在独立的 `internal/consumer/<business>` 子包（例如 `consumer/user`、`consumer/audit`），不要把业务处理代码放回 `internal/data/kafka`。HTTP 接口放入 `internal/server/http` 并注册模块路由，Proto RPC 实现放入 `internal/server/grpc` 并交给 Kitex 生成的服务注册器。总路由只负责模块编排，模块路由和 handler 负责本模块的协议转换。
 
 ## API 示例
 
